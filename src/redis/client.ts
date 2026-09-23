@@ -42,11 +42,13 @@ export async function redisPing(): Promise<{ ok: boolean; latencyMs: number; err
   if (!redis) return { ok: false, latencyMs: Date.now() - start, error: 'redis client unavailable' };
   try {
     if (redis.status !== 'ready') {
-      // lazy connection: ensure the connect attempt completes before judging
-      await Promise.race([
-        redis.connect().catch(() => {}),
-        new Promise((r) => setTimeout(r, 2000)),
-      ]);
+      // wait (bounded) for the lazy connection to establish
+      await new Promise<void>((resolve) => {
+        const onReady = () => { cleanup(); resolve(); };
+        const cleanup = () => { redis.off('ready', onReady); clearTimeout(timer); };
+        const timer = setTimeout(() => { cleanup(); resolve(); }, 2500);
+        redis.once('ready', onReady);
+      });
     }
     const pong = await redis.ping();
     available = true;
