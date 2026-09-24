@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Football Data Platform</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">⚽ Football Data Platform</div>
+    <nav>
+      <button data-tab="fixtures" class="active">Fixtures</button>
+      <button data-tab="competitions">Competitions</button>
+      <button data-tab="standings">Standings</button>
+      <button data-tab="teams">Teams</button>
+      <button data-tab="referees">Referees</button>
+    </nav>
+    <a class="admin-link" href="/admin/api-keys">Admin</a>
+  </header>
+
+  <main>
+    <section id="fixtures" class="tab active">
+      <h2>Live &amp; Upcoming Fixtures</h2>
+      <p class="note">All data is served by <b>our</b> REST API (<code>/api/v1</code>) with our own API keys — never the external provider.</p>
+      <div class="cols">
+        <div>
+          <h3>🔴 Live</h3>
+          <div id="live-list" class="card-list"></div>
+        </div>
+        <div>
+          <h3>📅 Upcoming</h3>
+          <div id="upcoming-list" class="card-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="competitions" class="tab">
+      <h2>Competitions</h2>
+      <table id="competitions-table"><thead><tr><th>Competition</th><th>Country</th><th>Type</th></tr></thead><tbody></tbody></table>
+    </section>
+
+    <section id="standings" class="tab">
+      <h2>Standings</h2>
+      <div class="filters">
+        <select id="standings-comp"><option value="">Select competition…</option></select>
+        <select id="standings-season"><option value="">Select season…</option></select>
+        <button id="standings-load">Load</button>
+      </div>
+      <table id="standings-table"><thead><tr><th>#</th><th>Team</th><th>P</th><th>W</th><th>D</th><th>L</th><th>GF</th><th>GA</th><th>GD</th><th>Pts</th><th>Form</th></tr></thead><tbody></tbody></table>
+    </section>
+
+    <section id="teams" class="tab">
+      <h2>Teams</h2>
+      <div class="filters">
+        <input id="team-search" placeholder="Search team name…" />
+        <button id="team-load">Search</button>
+      </div>
+      <table id="teams-table"><thead><tr><th>Team</th><th>Code</th><th>Founded</th></tr></thead><tbody></tbody></table>
+    </section>
+
+    <section id="referees" class="tab">
+      <h2>Referees</h2>
+      <p class="note">Click a referee for locally calculated card/foul/penalty analytics.</p>
+      <table id="referees-table"><thead><tr><th>Referee</th><th>Nationality</th></tr></thead><tbody></tbody></table>
+      <div id="referee-detail"></div>
+    </section>
+  </main>
+
+  <footer>Football Data Platform — website consumes OUR API only · <a href="/api/v1/docs">API docs</a></footer>
+  <script src="/app.js"></script>
+</body>
+</html>

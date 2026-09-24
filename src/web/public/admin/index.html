@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Admin · API Keys — Football Data Platform</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <style>
+    .login-box { max-width: 380px; margin: 80px auto; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 28px; }
+    .login-box h2 { margin-top: 0; }
+    .login-box input { width: 100%; margin: 8px 0; }
+    .login-box button { width: 100%; margin-top: 12px; background: var(--accent); border: none; color: #fff; padding: 10px; border-radius: 6px; font-weight: 600; }
+    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-top: 16px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .danger { color: var(--danger); }
+    .ok { color: var(--accent); }
+    .secret-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 20; align-items: center; justify-content: center; }
+    .secret-modal.show { display: flex; }
+    .secret-box { background: var(--panel); border: 1px solid var(--accent); border-radius: 10px; padding: 24px; max-width: 560px; width: 92%; }
+    .secret-box code { display: block; background: var(--bg); border: 1px solid var(--border); padding: 12px; border-radius: 6px; word-break: break-all; margin: 12px 0; }
+    .scopes label { display: inline-block; margin: 2px 6px 2px 0; font-size: 13px; color: var(--muted); }
+    .muted { color: var(--muted); font-size: 13px; }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">🔐 Admin · API Keys</div>
+    <nav><button data-href="/">← Back to website</button></nav>
+  </header>
+
+  <div id="login-view" class="login-box">
+    <h2>Administrator login</h2>
+    <p class="muted">Only authorized administrators can manage API keys.</p>
+    <input id="username" placeholder="Username" autocomplete="username" />
+    <input id="password" type="password" placeholder="Password" autocomplete="current-password" />
+    <button id="login-btn">Sign in</button>
+    <p id="login-error" class="danger"></p>
+  </div>
+
+  <main id="admin-view" style="display:none">
+    <div class="panel">
+      <h3>Create API client</h3>
+      <div class="row">
+        <input id="client-name" placeholder="Client name (e.g. Prediction App)" />
+        <input id="client-type" placeholder="Type (prediction_app / website / mobile)" value="prediction_app" />
+        <input id="client-rlm" type="number" placeholder="Req/min" value="60" style="width:90px" />
+        <input id="client-rld" type="number" placeholder="Req/day" value="10000" style="width:110px" />
+        <button id="client-create">Create client</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>Generate API key</h3>
+      <div class="row">
+        <select id="key-client"><option value="">Select client…</option></select>
+        <input id="key-label" placeholder="Label (optional)" />
+      </div>
+      <div class="scopes" id="scope-box"></div>
+      <div class="row" style="margin-top:10px">
+        <input id="key-expires" type="number" placeholder="Expires in days (blank = never)" style="width:200px" />
+        <button id="key-create">Generate API key</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>Keys</h3>
+      <table id="keys-table">
+        <thead><tr><th>Prefix</th><th>Client</th><th>Scopes</th><th>Created</th><th>Last used</th><th>Expires</th><th>Status</th><th>Actions</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h3>Usage</h3>
+      <table id="usage-table">
+        <thead><tr><th>Date</th><th>Client</th><th>Endpoint</th><th>Requests</th><th>OK</th><th>Failed</th><th>Rate-limited</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </main>
+
+  <div id="secret-modal" class="secret-modal">
+    <div class="secret-box">
+      <h3>✅ API key generated</h3>
+      <p class="danger">This secret is shown <b>ONE TIME</b>. Copy it now.</p>
+      <code id="secret-value"></code>
+      <div class="row">
+        <button id="copy-secret">Copy</button>
+        <button id="close-secret">I saved it — close</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/admin/admin.js"></script>
+</body>
+</html>
