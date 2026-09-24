@@ -14,7 +14,10 @@ import { config, ensureSecretsForProduction } from '../config.js';
 import { logger } from '../lib/logger.js';
 import { createClient, createKey, listKeys } from '../keys/service.js';
 
-const API_BASE = `http://127.0.0.1:${config.apiPort}`;
+// Where the website proxy finds OUR api. Defaults to the local API port;
+// set API_INTERNAL_URL when the API runs as a separate host/service.
+const API_BASE =
+  process.env.API_INTERNAL_URL?.replace(/\/$/, '') || `http://127.0.0.1:${config.apiPort}`;
 
 async function resolveSiteApiKey(): Promise<string> {
   if (process.env.SITE_API_KEY) return process.env.SITE_API_KEY;
