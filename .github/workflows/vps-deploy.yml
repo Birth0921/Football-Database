@@ -1,0 +1,58 @@
+name: VPS deploy
+
+# Deploys the platform to the production VPS over SSH.
+# Triggered manually (workflow_dispatch) or after pushes to main.
+# Credentials come from encrypted repo secrets — never from the repo.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: vps-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      VPS_HOST: 158.178.196.221
+      VPS_USER: ubuntu
+      APP_DIR: /opt/football-platform
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SSH key
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/vps_key
+          chmod 600 ~/.ssh/vps_key
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Transfer code
+        run: |
+          ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "mkdir -p $APP_DIR"
+          tar -cf - --exclude=.git . | ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "tar -xf - -C $APP_DIR"
+
+      - name: Write production .env (server-side only)
+        env:
+          VPS_ENV: ${{ secrets.VPS_ENV }}
+        run: |
+          printf '%s\n' "$VPS_ENV" | ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cat > $APP_DIR/.env && chmod 600 $APP_DIR/.env && echo '.env written (mode 600)'"
+
+      - name: Deploy (build, start, migrate, health-wait)
+        run: |
+          ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cd $APP_DIR && bash scripts/deploy/vps-deploy.sh"
+
+      - name: Verify from the VPS
+        run: |
+          ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cd $APP_DIR && bash scripts/deploy/vps-verify.sh" || true
+
+      - name: Verify from the public internet
+        run: |
+          echo "--- public checks (http://$VPS_HOST/) ---"
+          for p in / /admin/api-keys /api/v1/docs /api/v1/health /api/v1/health/data; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 "http://$VPS_HOST$p")
+            echo "GET $p -> $code"
+          done

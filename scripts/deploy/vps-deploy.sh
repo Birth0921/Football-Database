@@ -14,6 +14,7 @@ if ! command -v docker >/dev/null 2>&1; then
   log "docker not found — installing via get.docker.com…"
   curl -fsSL https://get.docker.com | sudo sh
 fi
+sudo usermod -aG docker "$USER" 2>/dev/null || true # takes effect on next login
 DOCKER="docker"
 if ! $DOCKER ps >/dev/null 2>&1; then DOCKER="sudo docker"; fi
 $DOCKER compose version >/dev/null 2>&1 || { log "ERROR: docker compose plugin missing"; exit 1; }
