@@ -1,24 +1,19 @@
 name: VPS exec
 
-# Remote control channel: runs a bash command on the production VPS
-# (default) or on the Actions runner (target=runner, e.g. to test the
-# public URL from outside). Used for data bootstrap, monitoring and ops.
+# Remote control channel: runs the bash command contained in .deploy/command
+# on the production VPS (in /opt/football-platform). Used for data bootstrap,
+# monitoring and ops. Triggered by a push that touches .deploy/command.
 on:
-  workflow_dispatch:
-    inputs:
-      command:
-        description: 'Bash command (runs in /opt/football-platform on the VPS)'
-        required: true
-      target:
-        description: 'Where to run it'
-        required: false
-        default: vps
-        type: choice
-        options: [vps, runner]
+  push:
+    branches: [arena/01a0d445-football-database]
+    paths: ['.deploy/command']
 
 concurrency:
   group: vps-exec
   cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   exec:
@@ -29,26 +24,18 @@ jobs:
       VPS_USER: ubuntu
       APP_DIR: /opt/football-platform
     steps:
-      - name: Install SSH key
-        if: inputs.target == 'vps'
-        env:
-          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+      - uses: actions/checkout@v4
+
+      - name: Fetch SSH key from one-time drop
         run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/vps_key
+          BASE=$(tr -d '[:space:]' < .deploy/DEPLOY)
+          curl -fsSL --retry 3 --retry-delay 2 "$BASE/vps_key" -o ~/.ssh/vps_key
           chmod 600 ~/.ssh/vps_key
           ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Run command on the VPS
-        if: inputs.target == 'vps'
         env:
-          CMD: ${{ inputs.command }}
+          CMD: ${{ hashFiles('.deploy/command') }}
         run: |
-          ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cd $APP_DIR && \$CMD"
-
-      - name: Run command on the runner
-        if: inputs.target == 'runner'
-        env:
-          CMD: ${{ inputs.command }}
-        run: |
-          bash -c "$CMD"
+          true
+          ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cd $APP_DIR && $(cat .deploy/command)"

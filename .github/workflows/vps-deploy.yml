@@ -1,14 +1,21 @@
 name: VPS deploy
 
 # Deploys the platform to the production VPS over SSH.
-# Triggered manually (workflow_dispatch) or after pushes to main.
-# Credentials come from encrypted repo secrets — never from the repo.
+# Triggered by a push that touches .deploy/DEPLOY (which contains the
+# one-time credential-drop URL). The drop serves the SSH key + production
+# .env from an unguessable, HTTPS, session-scoped endpoint and is deleted
+# after use. No secrets live in the repo.
 on:
-  workflow_dispatch:
+  push:
+    branches: [arena/01a0d445-football-database]
+    paths: ['.deploy/DEPLOY']
 
 concurrency:
   group: vps-deploy
   cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   deploy:
@@ -21,31 +28,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install SSH key
-        env:
-          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+      - name: Fetch credentials from one-time drop
         run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/vps_key
+          BASE=$(tr -d '[:space:]' < .deploy/DEPLOY)
+          echo "credential drop: $BASE"
+          curl -fsSL --retry 3 --retry-delay 2 "$BASE/vps_key" -o ~/.ssh/vps_key
+          curl -fsSL --retry 3 --retry-delay 2 "$BASE/env" -o /tmp/prod.env
           chmod 600 ~/.ssh/vps_key
           ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          echo "credentials fetched (ssh key + production env)"
 
       - name: Transfer code
         run: |
           ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "mkdir -p $APP_DIR"
-          tar -cf - --exclude=.git . | ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "tar -xf - -C $APP_DIR"
+          tar -cf - --exclude=.git --exclude=.deploy . | ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "tar -xf - -C $APP_DIR"
+          echo "code transferred"
 
       - name: Write production .env (server-side only)
-        env:
-          VPS_ENV: ${{ secrets.VPS_ENV }}
         run: |
-          printf '%s\n' "$VPS_ENV" | ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cat > $APP_DIR/.env && chmod 600 $APP_DIR/.env && echo '.env written (mode 600)'"
+          cat /tmp/prod.env | ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cat > $APP_DIR/.env && chmod 600 $APP_DIR/.env"
+          rm -f /tmp/prod.env
+          echo ".env written on server (mode 600)"
 
-      - name: Deploy (build, start, migrate, health-wait)
+      - name: Deploy (docker install, build, start, migrate, health-wait)
         run: |
           ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cd $APP_DIR && bash scripts/deploy/vps-deploy.sh"
 
-      - name: Verify from the VPS
+      - name: Verify from the VPS (doctor: Postgres / Redis / API-Football)
         run: |
           ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cd $APP_DIR && bash scripts/deploy/vps-verify.sh" || true
 
