@@ -138,7 +138,7 @@ internal URL.
 | `SYNC_UPCOMING_INTERVAL_SECONDS` | no | 900 |
 | `SYNC_POSTMATCH_INTERVAL_SECONDS` | no | 300 |
 | `SYNC_METADATA_INTERVAL_SECONDS` | no | 21600 |
-| `SITE_API_KEY` | no | website's own `pf_live_…` key (else auto-provisioned) |
+| `SITE_API_KEY` | no | operator override for the website proxy; by default a **managed Website key** is auto-provisioned (see API_KEYS.md) |
 | `LOG_LEVEL` | no | info |
 
 Production start-up refuses to boot with missing `JWT_SECRET`,

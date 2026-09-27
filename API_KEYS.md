@@ -51,12 +51,48 @@ npm run api-key:list
 `http://localhost:8080/admin/api-keys` (login `ADMIN_USER`/`ADMIN_PASSWORD`):
 
 create clients → set per-minute/per-day rate limits → generate keys (one-time
-secret modal with copy button) → view prefixes/scopes/last-used → rotate with
-24 h grace → revoke → view usage. After the creation dialog is closed the
-secret can never be displayed again.
+secret modal with copy button) → view prefixes/scopes/last-used/managed state →
+rotate with 24 h grace → revoke → **permanently delete** → view usage. After
+the creation dialog is closed the secret can never be displayed again.
 
 Admin API calls (`/admin/*`) require the admin Bearer token from
 `POST /api/v1/admin/login` or an API key with `admin:*` scopes.
+
+## Managed Website key (automatic)
+
+The public website authenticates against our API with exactly one
+**automatically managed** key — no configuration needed:
+
+- created on first Website boot if missing (advisory lock + partial unique
+  index on `api_keys.managed_role = 'website'` → never duplicates, even with
+  concurrent workers)
+- **read-only public scopes only** (`fixtures/teams/players/referees/standings/
+  statistics/predictions:read`) — never `admin:*`
+- **not regenerated on restart**: the raw key is stored encrypted at rest
+  (AES-256-GCM, key derived from `JWT_SECRET`) and re-resolved on boot
+- the browser never sees it — it lives only in the Website server process
+  (Browser → Website proxy → internal `/api/v1`)
+- if an admin permanently deletes it, the Website detects the auth failure on
+  the next request, provisions a verified replacement and retries — no manual
+  secret copying
+- **no periodic rotation** (no timers). Rotate on demand from the Admin UI
+  ("Rotate Key" on the Website row) or via
+  `POST /api/v1/admin/api-keys/:id/rotate-website`: the replacement is created
+  and verified **before** the old key is physically deleted; on any failure
+  the old working key survives. The new secret is never returned — it stays
+  server-side.
+
+`SITE_API_KEY` (env) remains available as an operator override and disables
+the managed mechanism while set.
+
+## Permanent deletion
+
+`DELETE /api/v1/admin/api-keys/:id` (admin auth) physically removes the key
+row, its hash and any managed secret. The key stops authenticating
+immediately, disappears from listings, and **cannot be recovered** (usage
+history is retained with `api_usage.api_key_id = NULL`). Idempotent: deleting
+an already-deleted key returns `deleted: false`. Only the key prefix is ever
+shown in dialogs, responses or audit logs.
 
 ## Authentication pipeline (every request)
 
