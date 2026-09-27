@@ -7,85 +7,126 @@
 - Redis 6+ (or Valkey — drop-in)
 - Docker + docker-compose (optional, provided)
 
-## Deploy online now
+## Deploy online now (production VPS)
 
-### Option 1 — Render (fastest, recommended)
+Reference topology (what this repo deploys with):
 
-The repo ships a Blueprint (`render.yaml`) that provisions everything:
+- **Oracle Cloud Ubuntu VPS** — runs the Docker services (`api`, `worker`,
+  `scheduler`, `web`)
+- **Neon Postgres** (managed) — use the **direct** endpoint (the one *without*
+  `-pooler.`): long-lived servers shouldn't share a transaction pooler, and
+  session-level features like the migration advisory lock are unsafe through it
+- **Upstash Redis** (managed) — use the `rediss://` (TLS) URL
 
-1. Push this repo to GitHub (already done for this workspace).
-2. Go to **render.com → New → Blueprint** and select the repo. Render creates:
-   managed PostgreSQL, a private Key Value (Redis) instance, and one Docker web
-   service running `ROLE=all` (API + worker + scheduler + website in one
-   container).
-3. At creation you are prompted for three secrets:
-   - `ADMIN_PASSWORD` — choose a strong password (admin dashboard login)
-   - `API_FOOTBALL_KEY` — your provider key, **or leave empty for mock mode**
-   - `SITE_API_KEY` — optional (a stable `pf_live_…` key for anonymous website
-     traffic; if left empty a fresh site key is provisioned per boot)
-   `JWT_SECRET` is generated automatically. Never commit these values.
-4. After the first deploy finishes, open the service Shell (dashboard →
-   `football-platform` → Shell) and bootstrap the data:
-   ```bash
-   npm run competitions:import
-   IMPORT_TASK_BUDGET=5000 npm run historical:import   # re-run to resume
-   npx tsx scripts/bulk-finalize.ts
-   npm run statistics:recalculate
-   npm run data-quality:check
-   npm run api-key:create -- --client "Prediction App" \
-     --scopes "fixtures:read,teams:read,players:read,referees:read,standings:read,statistics:read,predictions:read" \
-     --label "production" --expires 365
-   ```
-   (The CLI is included in the image. The historical import is resumable and
-   quota-aware — it may need 2–3 runs to finish.)
-5. Verify at `https://<your-service>.onrender.com`:
-   - `/` website · `/admin/api-keys` admin · `/api/v1/docs` OpenAPI
-   - `curl https://…/api/v1/health/data` → 200
-   - `curl -H "X-API-Key: pf_live_…" https://…/api/v1/fixtures` → data
-   The prediction app should point `FOOTBALL_API_BASE_URL` at
-   `https://<your-service>.onrender.com/api/v1` with its own `pf_live_…` key
-   (client keys are passed through the website proxy — verified in code).
-6. Attach a custom domain in the dashboard (Render manages TLS), and update
-   the prediction app's base URL.
+All production secrets live in the server-side `.env` (chmod 600, gitignored).
+`.env.example` documents the variable **names** only — never put real values in
+it and never commit secrets.
 
-Migrations run automatically at boot (`SKIP_MIGRATE=1` disables). For zero
-downtime later, split the container into separate `ROLE=api / web / worker /
-scheduler` services (same image; set `API_INTERNAL_URL` on the `web` service to
-the API's URL) and scale them independently.
-
-### Option 2 — Railway
-
-New → Project → Deploy from GitHub. Add Postgres and Redis (Key Value)
-plugins. On the Dockerfile service set `ROLE=all` and the env vars from the
-table below (`DATABASE_URL` / `REDIS_URL` are wired by the plugins; Railway
-injects `PORT`, which the servers accept). Run the bootstrap commands from
-step 4 in the service's shell.
-
-### Option 3 — any VPS with Docker (Hetzner, DigitalOcean, …)
+### 1. Prepare the VPS (once)
 
 ```bash
-git clone <repo> && cd Football-Database
-cp .env.example .env    # set DATABASE_URL, REDIS_URL, JWT_SECRET,
-                        # ADMIN_USER, ADMIN_PASSWORD, API_FOOTBALL_KEY
-docker compose up -d --build
-docker compose exec api npm run database:migrate
-docker compose exec api npm run competitions:import
-docker compose exec api env IMPORT_TASK_BUDGET=5000 npm run historical:import
-docker compose exec api npx tsx scripts/bulk-finalize.ts
-docker compose exec api npm run statistics:recalculate
-docker compose exec api npm run api-key:create -- --client "Prediction App" \
-  --scopes "fixtures:read,teams:read,players:read,referees:read,standings:read,statistics:read,predictions:read"
+ssh ubuntu@<VPS-IP>                    # 'opc' on Oracle Linux images
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker $USER && exit  # then log in again
 ```
-Put Caddy/nginx in front with TLS (free certs) proxying to `:8080` (website +
-`/api/v1` via the site proxy) and, if you want a separate API hostname,
-directly to `:4000`. Firewall PostgreSQL/Redis to loopback.
+
+Open the web port in the **Oracle Cloud console**: Networking → Virtual Cloud
+Networks → your VCN → Security Lists → Default Security List → **Add Ingress
+Rule**: Source `0.0.0.0/0`, Destination Port `80` (TCP). The deploy script
+handles the in-host iptables rule; the ingress rule must be added in the OCI
+console.
+
+### 2. Place code + secrets on the server
+
+```bash
+# from your machine — no GitHub access needed on the VPS:
+git archive HEAD | ssh ubuntu@<VPS-IP> 'mkdir -p /opt/football-platform && tar -x -C /opt/football-platform'
+scp .env ubuntu@<VPS-IP>:/opt/football-platform/.env   # server-side secrets only
+```
+
+Server-side `.env` (production): `DATABASE_URL` (Neon **direct** endpoint),
+`REDIS_URL` (`rediss://…` Upstash), `NODE_ENV=production`, `JWT_SECRET`,
+`ADMIN_USER`/`ADMIN_PASSWORD`, `API_FOOTBALL_KEY`, `PUBLIC_BASE_URL=http://<VPS-IP>/`,
+`WEB_PORT=80`, `WORKER_SWEEP_INTERVAL_SECONDS=15`.
+
+### 3. Deploy
+
+```bash
+ssh ubuntu@<VPS-IP>
+cd /opt/football-platform
+scripts/deploy/vps-deploy.sh
+```
+
+The script is idempotent: installs Docker if missing, validates `.env`, opens
+the host firewall for the web port, builds and starts the services, waits for
+`/api/v1/health`, and prints the status. Migrations apply automatically on API
+boot (advisory-lock protected; `SKIP_MIGRATE=1` disables).
+
+| Service | Role | Ports | Notes |
+|---|---|---|---|
+| `web` | website + admin + `/api/v1` proxy | `${WEB_PORT:-8080}` public | proxies to `http://api:4000`, passes client API keys through |
+| `api` | REST API | `127.0.0.1:4000` (loopback) | healthcheck `/api/v1/health` |
+| `worker` | sync task executor | — | waits for API health |
+| `scheduler` | periodic sync scheduling | — | waits for API health |
+| `migrate` | one-shot migrations | — | `docker compose --profile tools run --rm migrate` |
+| `postgres` / `redis` | self-hosted fallbacks | — | only with `--profile local` |
+
+### 4. Verify
+
+```bash
+scripts/deploy/vps-verify.sh            # doctor (DB/Redis/provider) + endpoints
+# optionally with a key:
+scripts/deploy/vps-verify.sh pf_live_xxxxxxxx
+```
+
+From a browser: `http://<VPS-IP>/` (website) · `/admin/api-keys` (admin) ·
+`/api/v1/docs` (OpenAPI).
+
+### 5. Bootstrap real data (first time only)
+
+```bash
+docker compose run --rm api npm run competitions:import
+docker compose run --rm api env IMPORT_TASK_BUDGET=5000 npm run historical:import  # resumable
+docker compose run --rm api npx tsx scripts/bulk-finalize.ts
+docker compose run --rm api npm run statistics:recalculate
+docker compose run --rm api npm run data-quality:check
+docker compose run --rm api npm run api-key:create -- --client "Prediction App" \
+  --scopes "fixtures:read,teams:read,players:read,referees:read,standings:read,statistics:read,predictions:read" \
+  --label production --expires 365
+```
+
+Then point the prediction app at `http://<VPS-IP>/api/v1` with its `pf_live_…`
+key (client keys are forwarded by the web proxy).
+
+### 6. TLS + custom domain (recommended)
+
+Caddy on the host gives automatic Let's Encrypt certs:
+
+```caddyfile
+football.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+(Set `WEB_PORT=8080` behind a reverse proxy; Caddy owns :80/:443.)
+
+### Updating
+
+```bash
+git archive HEAD | ssh ubuntu@<VPS-IP> 'tar -x -C /opt/football-platform'  # or git pull
+ssh ubuntu@<VPS-IP> 'cd /opt/football-platform && scripts/deploy/vps-deploy.sh'
+```
+
+To scale later, run the same image as separate services with
+`ROLE=api|web|worker|scheduler` and point `API_INTERNAL_URL` at the API's
+internal URL.
 
 ## Environment variables
 
 | Variable | Required | Notes |
 |----------|----------|-------|
-| `DATABASE_URL` | yes | `postgres://user:pass@host:5432/football` |
-| `REDIS_URL` | yes | `redis://host:6379` |
+| `DATABASE_URL` | yes | `postgres://user:pass@host:5432/football` · Neon: use the **direct** endpoint (no `-pooler.`) |
+| `REDIS_URL` | yes | `redis://host:6379` · Upstash: use `rediss://…` (TLS) |
 | `API_FOOTBALL_KEY` | for live data | empty ⇒ mock provider mode |
 | `JWT_SECRET` | yes (prod) | ≥16 random chars (`openssl rand -hex 32`) |
 | `ADMIN_USER` / `ADMIN_PASSWORD` | yes (prod) | admin dashboard login |

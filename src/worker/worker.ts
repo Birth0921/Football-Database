@@ -15,7 +15,7 @@ async function main(): Promise<void> {
   // periodic sweep: picks up queued tasks (also after crashes / grace re-dispatch)
   const sweep = setInterval(() => {
     void dispatchDueTasks(10).catch((err) => logger.warn({ err: (err as Error).message }, 'dispatch sweep failed'));
-  }, 5000);
+  }, config.workerSweepIntervalSeconds * 1000);
   void dispatchDueTasks(50);
 
   logger.info({ providerMode: config.providerMode }, 'worker ready');

@@ -57,6 +57,7 @@ export const config = {
   syncUpcomingIntervalSeconds: num('SYNC_UPCOMING_INTERVAL_SECONDS', 900),
   syncPostmatchIntervalSeconds: num('SYNC_POSTMATCH_INTERVAL_SECONDS', 300),
   syncMetadataIntervalSeconds: num('SYNC_METADATA_INTERVAL_SECONDS', 21600),
+  workerSweepIntervalSeconds: num('WORKER_SWEEP_INTERVAL_SECONDS', 5),
   replayFromRaw: bool('REPLAY_FROM_RAW', true),
   logLevel: str('LOG_LEVEL', 'info'),
   get providerMode(): 'live' | 'mock' {
