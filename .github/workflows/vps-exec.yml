@@ -34,8 +34,5 @@ jobs:
           ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Run command on the VPS
-        env:
-          CMD: ${{ hashFiles('.deploy/command') }}
         run: |
-          true
           ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cd $APP_DIR && $(cat .deploy/command)"

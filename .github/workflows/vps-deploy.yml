@@ -54,7 +54,7 @@ jobs:
         run: |
           ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cd $APP_DIR && bash scripts/deploy/vps-deploy.sh"
 
-      - name: Verify from the VPS (doctor: Postgres / Redis / API-Football)
+      - name: "Verify from the VPS (doctor: Postgres / Redis / API-Football)"
         run: |
           ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cd $APP_DIR && bash scripts/deploy/vps-verify.sh" || true
 
