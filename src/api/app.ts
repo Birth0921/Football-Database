@@ -10,8 +10,9 @@ import {
 } from './middleware.js';
 import {
   createClient, createKey, listClients, listKeys, revokeKey, rotateKey, usageReport,
-  updateClientLimits, ALL_SCOPES,
+  updateClientLimits, deleteKeyPermanently, ALL_SCOPES,
 } from '../keys/service.js';
+import { getManagedWebsiteKeyRecord, rotateWebsiteKey } from '../keys/website-key.js';
 import { quotaManager } from '../sync/quota.js';
 import { NotFoundError, AppError } from '../types.js';
 import { config } from '../config.js';
@@ -265,7 +266,11 @@ export function createApp(): Express {
     LEFT JOIN teams ht ON ht.id = f.home_team_id
     LEFT JOIN teams at ON at.id = f.away_team_id
     LEFT JOIN competitions c ON c.id = f.competition_id
-    LEFT JOIN seasons se ON se.id = f.season_id`;
+    LEFT JOIN seasons se ON se.id = f.season_id
+    LEFT JOIN venues v ON v.id = f.venue_id`;
+  const fixtureCols = `f.*, ht.name AS home_team_name, at.name AS away_team_name,
+       ht.logo_url AS home_team_logo, at.logo_url AS away_team_logo,
+       c.name AS competition_name, se.display_name AS season_name, v.name AS venue_name`;
 
   v1.get('/fixtures', asyncHandler(async (req, res) => {
     const { page, perPage, offset } = pagination(req);
@@ -273,7 +278,8 @@ export function createApp(): Express {
     const total = (await queryOne<{ c: number }>(`SELECT count(*)::int AS c ${fixtureJoin} ${where}`, params))?.c ?? 0;
     params.push(perPage, offset);
     const rows = await query(
-      `SELECT f.*, ht.name AS home_team_name, at.name AS away_team_name, c.name AS competition_name, se.display_name AS season_name
+      `SELECT
+       ${fixtureCols}
        ${fixtureJoin} ${where} ORDER BY f.kickoff_utc ASC NULLS LAST LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params,
     );
@@ -283,7 +289,8 @@ export function createApp(): Express {
     const { page, perPage, offset } = pagination(req);
     const total = (await queryOne<{ c: number }>(`SELECT count(*)::int AS c ${fixtureJoin} WHERE f.status_short = 'NS' AND f.kickoff_utc > now()`))?.c ?? 0;
     const rows = await query(
-      `SELECT f.*, ht.name AS home_team_name, at.name AS away_team_name, c.name AS competition_name, se.display_name AS season_name
+      `SELECT
+       ${fixtureCols}
        ${fixtureJoin} WHERE f.status_short = 'NS' AND f.kickoff_utc > now()
        ORDER BY f.kickoff_utc ASC LIMIT $1 OFFSET $2`,
       [perPage, offset],
@@ -294,7 +301,8 @@ export function createApp(): Express {
     const cached = await cacheGet(cacheKeys.live());
     if (cached) return res.json({ ok: true, data: cached, cached: true });
     const rows = await query(
-      `SELECT f.*, ht.name AS home_team_name, at.name AS away_team_name, c.name AS competition_name
+      `SELECT
+       ${fixtureCols}
        ${fixtureJoin} WHERE f.status_short IN ('1H','HT','2H','ET','BT','P','INT') ORDER BY f.kickoff_utc ASC`,
     );
     await cacheSet(cacheKeys.live(), rows, CACHE_TTL.liveFixtures);
@@ -306,7 +314,8 @@ export function createApp(): Express {
     const where = `WHERE f.status_short IN ('FT','AET','PEN') AND f.kickoff_utc::date = $1::date`;
     const total = (await queryOne<{ c: number }>(`SELECT count(*)::int AS c ${fixtureJoin} ${where}`, [day]))?.c ?? 0;
     const rows = await query(
-      `SELECT f.*, ht.name AS home_team_name, at.name AS away_team_name, c.name AS competition_name
+      `SELECT
+       ${fixtureCols}
        ${fixtureJoin} ${where} ORDER BY f.kickoff_utc DESC LIMIT $2 OFFSET $3`,
       [day, perPage, offset],
     );
@@ -315,11 +324,11 @@ export function createApp(): Express {
 
   async function fixtureDetail(id: number) {
     const row = await queryOne(
-      `SELECT f.*, ht.name AS home_team_name, at.name AS away_team_name, c.name AS competition_name, se.display_name AS season_name,
-              r.name AS referee_name, v.name AS venue_name
+      `SELECT
+       ${fixtureCols},
+              r.name AS referee_name
        ${fixtureJoin}
        LEFT JOIN referees r ON r.id = f.referee_id
-       LEFT JOIN venues v ON v.id = f.venue_id
        WHERE f.id = $1`,
       [id],
     );
@@ -430,6 +439,7 @@ export function createApp(): Express {
       id: k.id, client_id: k.client_id, client_name: k.client_name, key_prefix: k.key_prefix,
       scopes: k.scopes, label: k.label, created_at: k.created_at, last_used_at: k.last_used_at,
       expires_at: k.expires_at, revoked_at: k.revoked_at, grace_until: k.grace_until, rotated_from: k.rotated_from,
+      managed_role: k.managed_role ?? null,
     })); // never the raw key or its hash
     res.json({ ok: true, data: { keys, clients: await listClients(), scopes: ALL_SCOPES } });
   }));
@@ -467,6 +477,23 @@ export function createApp(): Express {
   v1.post('/admin/api-keys/:id/revoke', requireAdmin(), asyncHandler(async (req, res) => {
     await revokeKey(Number(req.params.id), (req.body as { reason?: string })?.reason ?? 'revoked via admin UI', 'admin-ui');
     res.json({ ok: true });
+  }));
+  v1.delete('/admin/api-keys/:id', requireAdmin(), asyncHandler(async (req, res) => {
+    // PERMANENT physical deletion (not a soft revoke). Idempotent.
+    const result = await deleteKeyPermanently(Number(req.params.id), 'admin-ui');
+    res.json({ ok: true, data: { deleted: result.deleted, id: result.id, key_prefix: result.keyPrefix } });
+  }));
+  v1.post('/admin/api-keys/:id/rotate-website', requireAdmin(), asyncHandler(async (req, res) => {
+    // Manual, on-demand rotation of the managed Website key (never periodic).
+    // Creates + verifies the replacement BEFORE the old key is deleted; the
+    // new secret stays server-side (never returned to anyone).
+    const keyId = Number(req.params.id);
+    const managed = await getManagedWebsiteKeyRecord();
+    if (!managed || Number(managed.id) !== keyId) {
+      throw new AppError('this key is not the managed website key', 400, 'VALIDATION');
+    }
+    const rotated = await rotateWebsiteKey('admin-ui');
+    res.json({ ok: true, data: { id: rotated.id, key_prefix: rotated.keyPrefix, managed_role: 'website' } });
   }));
   v1.patch('/admin/clients/:id', requireAdmin(), asyncHandler(async (req, res) => {
     const body = (req.body ?? {}) as { rate_limit_per_minute?: number; rate_limit_per_day?: number; active?: boolean };

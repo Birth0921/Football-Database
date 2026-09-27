@@ -3,93 +3,131 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Admin · API Keys — Football Data Platform</title>
-  <link rel="stylesheet" href="/styles.css" />
-  <style>
-    .login-box { max-width: 380px; margin: 80px auto; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 28px; }
-    .login-box h2 { margin-top: 0; }
-    .login-box input { width: 100%; margin: 8px 0; }
-    .login-box button { width: 100%; margin-top: 12px; background: var(--accent); border: none; color: #fff; padding: 10px; border-radius: 6px; font-weight: 600; }
-    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-top: 16px; }
-    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-    .danger { color: var(--danger); }
-    .ok { color: var(--accent); }
-    .secret-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 20; align-items: center; justify-content: center; }
-    .secret-modal.show { display: flex; }
-    .secret-box { background: var(--panel); border: 1px solid var(--accent); border-radius: 10px; padding: 24px; max-width: 560px; width: 92%; }
-    .secret-box code { display: block; background: var(--bg); border: 1px solid var(--border); padding: 12px; border-radius: 6px; word-break: break-all; margin: 12px 0; }
-    .scopes label { display: inline-block; margin: 2px 6px 2px 0; font-size: 13px; color: var(--muted); }
-    .muted { color: var(--muted); font-size: 13px; }
-  </style>
+  <title>Admin · API Keys · Football Data Platform</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2322c55e' stroke-width='1.6'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 7.5l3.5 2.6-1.3 4.1H9.8L8.5 10.1 12 7.5zM12 3v4.5M20.6 9.3l-5.1.8M17.7 19.2l-3.2-3.5M6.3 19.2l3.2-3.5M3.4 9.3l5.1.8'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/admin/admin.css" />
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">🔐 Admin · API Keys</div>
-    <nav><button data-href="/">← Back to website</button></nav>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="/" aria-label="Back to public site">
+        <span class="brand-ball" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><path d="M12 7.5l3.5 2.6-1.3 4.1H9.8L8.5 10.1 12 7.5zM12 3v4.5M20.6 9.3l-5.1.8M17.7 19.2l-3.2-3.5M6.3 19.2l3.2-3.5M3.4 9.3l5.1.8"/></svg>
+        </span>
+        <span class="brand-text">Football&nbsp;Data<strong>Platform</strong></span>
+      </a>
+      <nav class="admin-nav">
+        <span class="admin-tag">Admin</span>
+        <a href="/" class="btn btn-ghost">← Public site</a>
+        <button class="btn btn-ghost" id="logout-btn" type="button" hidden>Log out</button>
+      </nav>
+    </div>
   </header>
 
-  <div id="login-view" class="login-box">
-    <h2>Administrator login</h2>
-    <p class="muted">Only authorized administrators can manage API keys.</p>
-    <input id="username" placeholder="Username" autocomplete="username" />
-    <input id="password" type="password" placeholder="Password" autocomplete="current-password" />
-    <button id="login-btn">Sign in</button>
-    <p id="login-error" class="danger"></p>
-  </div>
+  <main id="main" class="container">
+    <!-- ============ LOGIN ============ -->
+    <section id="login-view" class="login-card">
+      <h1>Admin sign in</h1>
+      <p class="panel-sub">API-key management for the Football Data Platform.</p>
+      <form id="login-form">
+        <label class="field"><span>Username</span>
+          <input id="username" autocomplete="username" required />
+        </label>
+        <label class="field"><span>Password</span>
+          <input id="password" type="password" autocomplete="current-password" required />
+        </label>
+        <p class="login-error" id="login-error" role="alert"></p>
+        <button class="btn btn-primary btn-block" id="login-btn" type="submit">Sign in</button>
+      </form>
+    </section>
 
-  <main id="admin-view" style="display:none">
-    <div class="panel">
-      <h3>Create API client</h3>
-      <div class="row">
-        <input id="client-name" placeholder="Client name (e.g. Prediction App)" />
-        <input id="client-type" placeholder="Type (prediction_app / website / mobile)" value="prediction_app" />
-        <input id="client-rlm" type="number" placeholder="Req/min" value="60" style="width:90px" />
-        <input id="client-rld" type="number" placeholder="Req/day" value="10000" style="width:110px" />
-        <button id="client-create">Create client</button>
+    <!-- ============ DASHBOARD ============ -->
+    <section id="admin-view" hidden>
+      <div class="panel-head">
+        <div>
+          <h1>API keys</h1>
+          <p class="panel-sub">Issue, rotate and permanently delete credentials for our REST API.
+            Secrets are shown <b>exactly once</b> at creation.</p>
+        </div>
+        <button class="btn btn-ghost btn-icon" id="refresh-btn" type="button" aria-label="Refresh">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6"/></svg>
+          Refresh
+        </button>
       </div>
-    </div>
 
-    <div class="panel">
-      <h3>Generate API key</h3>
-      <div class="row">
-        <select id="key-client"><option value="">Select client…</option></select>
-        <input id="key-label" placeholder="Label (optional)" />
+      <div id="keys-wrap" class="table-wrap"></div>
+
+      <div class="two-col">
+        <section class="card">
+          <h2>Create client</h2>
+          <p class="panel-sub">Clients group keys and carry rate limits.</p>
+          <form id="client-form">
+            <label class="field"><span>Name</span><input id="client-name" required placeholder="Prediction App" /></label>
+            <div class="row">
+              <label class="field grow"><span>Type</span><input id="client-type" placeholder="application" /></label>
+              <label class="field"><span>Req / minute</span><input id="client-rlm" type="number" min="1" value="60" /></label>
+              <label class="field"><span>Req / day</span><input id="client-rld" type="number" min="1" value="10000" /></label>
+            </div>
+            <button class="btn" id="client-create" type="submit">Create client</button>
+          </form>
+        </section>
+
+        <section class="card">
+          <h2>Create API key</h2>
+          <p class="panel-sub">The full key is displayed once, then never again.</p>
+          <form id="key-form">
+            <label class="field"><span>Client</span><select id="key-client" required></select></label>
+            <label class="field"><span>Label (optional)</span><input id="key-label" placeholder="production" /></label>
+            <div class="row">
+              <label class="field grow"><span>Expires (days, empty = never)</span><input id="key-expires" type="number" min="1" placeholder="365" /></label>
+            </div>
+            <fieldset class="field">
+              <legend>Scopes</legend>
+              <div id="scope-box" class="scope-box"></div>
+            </fieldset>
+            <button class="btn btn-primary" id="key-create" type="submit">Create key</button>
+          </form>
+        </section>
       </div>
-      <div class="scopes" id="scope-box"></div>
-      <div class="row" style="margin-top:10px">
-        <input id="key-expires" type="number" placeholder="Expires in days (blank = never)" style="width:200px" />
-        <button id="key-create">Generate API key</button>
-      </div>
-    </div>
 
-    <div class="panel">
-      <h3>Keys</h3>
-      <table id="keys-table">
-        <thead><tr><th>Prefix</th><th>Client</th><th>Scopes</th><th>Created</th><th>Last used</th><th>Expires</th><th>Status</th><th>Actions</th></tr></thead>
-        <tbody></tbody>
-      </table>
-    </div>
-
-    <div class="panel">
-      <h3>Usage</h3>
-      <table id="usage-table">
-        <thead><tr><th>Date</th><th>Client</th><th>Endpoint</th><th>Requests</th><th>OK</th><th>Failed</th><th>Rate-limited</th></tr></thead>
-        <tbody></tbody>
-      </table>
-    </div>
+      <section class="card">
+        <h2>Usage (last records)</h2>
+        <div id="usage-wrap" class="table-wrap"></div>
+      </section>
+    </section>
   </main>
 
-  <div id="secret-modal" class="secret-modal">
-    <div class="secret-box">
-      <h3>✅ API key generated</h3>
-      <p class="danger">This secret is shown <b>ONE TIME</b>. Copy it now.</p>
-      <code id="secret-value"></code>
-      <div class="row">
-        <button id="copy-secret">Copy</button>
-        <button id="close-secret">I saved it — close</button>
+  <!-- ============ one-time secret modal ============ -->
+  <dialog class="modal" id="secret-modal" aria-labelledby="secret-title">
+    <div class="modal-card">
+      <h2 id="secret-title">Save this key now</h2>
+      <p class="modal-sub">This is the <b>only</b> time the full key is shown. Store it somewhere safe —
+        it cannot be displayed again.</p>
+      <div class="secret-row">
+        <code id="secret-value" class="secret-value"></code>
+        <button class="btn" id="copy-secret" type="button">Copy</button>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-primary" id="close-secret" type="button">I've saved it</button>
       </div>
     </div>
-  </div>
+  </dialog>
+
+  <!-- ============ confirm dialog ============ -->
+  <dialog class="modal" id="confirm-modal" aria-labelledby="confirm-title">
+    <div class="modal-card">
+      <h2 id="confirm-title"></h2>
+      <p class="modal-sub" id="confirm-text"></p>
+      <div class="modal-actions">
+        <button class="btn" id="confirm-cancel" type="button">Cancel</button>
+        <button class="btn btn-danger" id="confirm-ok" type="button">Confirm</button>
+      </div>
+    </div>
+  </dialog>
+
+  <div class="toast-stack" id="toast-stack" role="status" aria-live="polite"></div>
 
   <script src="/admin/admin.js"></script>
 </body>

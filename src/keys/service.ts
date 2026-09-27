@@ -133,6 +133,21 @@ export async function revokeKey(keyIdOrPrefix: string | number, reason = 'revoke
   await audit(actor, 'key.revoke', { apiKeyId: old.id, reason });
 }
 
+/**
+ * PERMANENT deletion: physically removes the api_keys row (and its hash /
+ * managed secret via cascade). The key immediately stops authenticating and
+ * cannot be recovered. Usage history is preserved (api_usage.api_key_id is
+ * set NULL by the FK). Idempotent: deleting an already-deleted key succeeds
+ * with deleted=false. The raw/full key is never logged or returned.
+ */
+export async function deleteKeyPermanently(keyId: number, actor = 'admin-ui'): Promise<{ deleted: boolean; id: number; keyPrefix: string | null }> {
+  const row = await queryOne<{ id: number; key_prefix: string }>(
+    `DELETE FROM api_keys WHERE id = $1 RETURNING id, key_prefix`, [keyId],
+  );
+  await audit(actor, 'key.permanent_delete', { apiKeyId: keyId, keyPrefix: row?.key_prefix ?? null, deleted: Boolean(row) });
+  return { deleted: Boolean(row), id: keyId, keyPrefix: row?.key_prefix ?? null };
+}
+
 export interface KeyRecord {
   id: number;
   client_id: number;
@@ -146,6 +161,7 @@ export interface KeyRecord {
   revoked_at: Date | null;
   grace_until: Date | null;
   rotated_from: number | null;
+  managed_role: string | null;
   client_name?: string;
   client_active?: boolean;
   rate_limit_per_minute?: number;

@@ -213,3 +213,88 @@ describe('security', () => {
     expect(gen.keyHash).toHaveLength(64);
   });
 });
+
+describe('admin permanent key deletion (endpoint)', () => {
+  it('admin can permanently delete a key; it immediately fails auth and disappears from the list', async () => {
+    const { deleteKeyPermanently } = await import('../src/keys/service.js');
+    const created = await createKey({ clientName: `API Test Admin ${suffix}`, scopes: ['fixtures:read'] });
+    const okRes = await request(app).get('/api/v1/fixtures').set('X-API-Key', created.rawKey);
+    expect(okRes.status).toBe(200);
+
+    const del = await request(app).delete(`/api/v1/admin/api-keys/${created.id}`).set('X-API-Key', adminKey);
+    expect(del.status).toBe(200);
+    expect(del.body.data.deleted).toBe(true);
+    expect(JSON.stringify(del.body)).not.toContain(created.rawKey); // prefix only, never the full secret
+
+    const authRes = await request(app).get('/api/v1/fixtures').set('X-API-Key', created.rawKey);
+    expect(authRes.status).toBe(401); // deleted key stops authenticating immediately
+
+    const list = await request(app).get('/api/v1/admin/api-keys').set('X-API-Key', adminKey);
+    expect(list.status).toBe(200);
+    expect(list.body.data.keys.some((k: { id: number }) => k.id === created.id)).toBe(false);
+    void deleteKeyPermanently;
+  });
+
+  it('non-admin API users can NEVER delete keys', async () => {
+    const victim = await createKey({ clientName: `API Test Admin ${suffix}`, scopes: ['fixtures:read'] });
+    const res = await request(app).delete(`/api/v1/admin/api-keys/${victim.id}`).set('X-API-Key', readerKey);
+    expect(res.status).toBe(403);
+    const stillThere = await query(`SELECT id FROM api_keys WHERE id = $1`, [victim.id]);
+    expect(stillThere.length).toBe(1);
+  });
+
+  it('deleting an already-deleted key is safe (idempotent)', async () => {
+    const temp = await createKey({ clientName: `API Test Admin ${suffix}`, scopes: ['fixtures:read'] });
+    await request(app).delete(`/api/v1/admin/api-keys/${temp.id}`).set('X-API-Key', adminKey);
+    const again = await request(app).delete(`/api/v1/admin/api-keys/${temp.id}`).set('X-API-Key', adminKey);
+    expect(again.status).toBe(200);
+    expect(again.body.data.deleted).toBe(false);
+  });
+});
+
+describe('managed website key (endpoint)', () => {
+  it('lists the managed key with managed_role indicator', async () => {
+    const { ensureWebsiteKey } = await import('../src/keys/website-key.js');
+    const ensured = await ensureWebsiteKey('api-test');
+    const list = await request(app).get('/api/v1/admin/api-keys').set('X-API-Key', adminKey);
+    const managed = list.body.data.keys.find((k: { id: number }) => k.id === ensured.record.id);
+    expect(managed).toBeTruthy();
+    expect(managed.managed_role).toBe('website');
+    expect(JSON.stringify(list.body)).not.toMatch(/pf_live_[A-Za-z0-9_]{20,}/);
+  });
+
+  it('rotates the website key on demand: no secret returned, old key replaced, new key authenticates', async () => {
+    const { ensureWebsiteKey, resolveWebsiteKey } = await import('../src/keys/website-key.js');
+    const before = await ensureWebsiteKey('api-test');
+
+    const rot = await request(app)
+      .post(`/api/v1/admin/api-keys/${before.record.id}/rotate-website`)
+      .set('X-API-Key', adminKey)
+      .send({});
+    expect(rot.status).toBe(200);
+    expect(rot.body.data.managed_role).toBe('website');
+    expect(rot.body.data.api_key).toBeUndefined(); // no raw key field at all
+    expect(JSON.stringify(rot.body)).not.toMatch(/pf_live_[A-Za-z0-9]+_[A-Za-z0-9_-]{10,}/); // at most a prefix
+
+    const resolved = await resolveWebsiteKey();
+    expect(Number(resolved!.record.id)).toBe(rot.body.data.id);
+    const auth = await request(app).get('/api/v1/fixtures').set('X-API-Key', resolved!.rawKey);
+    expect(auth.status).toBe(200); // replacement verified and working
+  });
+
+  it('rejects website rotation for a non-managed key', async () => {
+    const temp = await createKey({ clientName: `API Test Admin ${suffix}`, scopes: ['fixtures:read'] });
+    const res = await request(app).post(`/api/v1/admin/api-keys/${temp.id}/rotate-website`).set('X-API-Key', adminKey).send({});
+    expect(res.status).toBe(400);
+  });
+
+  it('fixture list responses include team logos and venue for the UI', async () => {
+    const res = await request(app).get('/api/v1/fixtures?per_page=3').set('X-API-Key', readerKey);
+    expect(res.status).toBe(200);
+    for (const f of res.body.data) {
+      expect(f).toHaveProperty('home_team_logo');
+      expect(f).toHaveProperty('away_team_logo');
+      expect(f).toHaveProperty('venue_name');
+    }
+  });
+});

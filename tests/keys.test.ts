@@ -156,3 +156,49 @@ describe('usage tracking', () => {
     expect(row?.rate_limited_requests).toBe(1);
   });
 });
+
+describe('permanent key deletion', () => {
+  it('physically removes the key: auth fails immediately, row and hash are gone', async () => {
+    const { deleteKeyPermanently } = await import('../src/keys/service.js');
+    const created = await createKey({ clientName: `Test Client ${suffix}`, scopes: ['fixtures:read'] });
+    expect((await authenticateApiKey(created.rawKey, 'fixtures:read')).ok).toBe(true);
+
+    const result = await deleteKeyPermanently(created.id, 'test');
+    expect(result.deleted).toBe(true);
+    expect(result.keyPrefix).toBe(created.keyPrefix);
+
+    const auth = await authenticateApiKey(created.rawKey, 'fixtures:read');
+    expect(auth.ok).toBe(false); // immediately stops authenticating
+    const row = await queryOne(`SELECT * FROM api_keys WHERE id = $1`, [created.id]);
+    expect(row).toBeNull(); // record AND stored hash physically removed
+    const listed = await (await import('../src/keys/service.js')).listKeys();
+    expect(listed.some((k) => k.id === created.id)).toBe(false); // gone from listing
+  });
+
+  it('is idempotent when the key is already gone', async () => {
+    const { deleteKeyPermanently } = await import('../src/keys/service.js');
+    const created = await createKey({ clientName: `Test Client ${suffix}`, scopes: ['fixtures:read'] });
+    await deleteKeyPermanently(created.id, 'test');
+    const again = await deleteKeyPermanently(created.id, 'test'); // no throw, deleted=false
+    expect(again.deleted).toBe(false);
+  });
+
+  it('handles rotation lineage safely: deleting an ancestor nulls rotated_from, keeps the child', async () => {
+    const { deleteKeyPermanently } = await import('../src/keys/service.js');
+    const parent = await createKey({ clientName: `Test Client ${suffix}`, scopes: ['fixtures:read'] });
+    const child = await rotateKey(parent.id, { graceHours: 0 });
+    await deleteKeyPermanently(parent.id, 'test');
+    const childRow = await queryOne<{ rotated_from: number | null }>(`SELECT rotated_from FROM api_keys WHERE id = $1`, [child.id]);
+    expect(childRow).not.toBeNull();
+    expect(childRow!.rotated_from).toBeNull(); // FK set null, child survives
+  });
+
+  it('never logs or returns the full secret', async () => {
+    const { deleteKeyPermanently } = await import('../src/keys/service.js');
+    const created = await createKey({ clientName: `Test Client ${suffix}`, scopes: ['fixtures:read'] });
+    const result = await deleteKeyPermanently(created.id, 'test');
+    expect(JSON.stringify(result)).not.toContain(created.rawKey);
+    const audit = await query(`SELECT * FROM api_audit_log WHERE action = 'key.permanent_delete' AND api_key_id = $1`, [created.id]);
+    expect(JSON.stringify(audit)).not.toContain(created.rawKey); // prefix may appear, never the secret
+  });
+});

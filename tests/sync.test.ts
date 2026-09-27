@@ -280,3 +280,75 @@ describe('CLI orchestration', () => {
     expect(tasks.length).toBeGreaterThan(0);
   });
 });
+
+describe('competitions import (optimized, batched)', () => {
+  it('imports ALL provider leagues and pairs every competition with every known season', async () => {
+    // every league the provider returned exists exactly once
+    const comps = await query<{ provider_id: string; n: number }>(
+      `SELECT provider_id, count(*)::int AS n FROM competitions GROUP BY provider_id`,
+    );
+    const byId = new Map(comps.map((c) => [c.provider_id, c.n]));
+    for (const pid of ['39', '140', '40', '758']) {
+      expect(byId.get(pid)).toBe(1); // all provider leagues imported, no duplicates
+    }
+    // every competition × every season year is linked (4 comps × 5 years)
+    const links = await query<{ c: number }>(
+      `SELECT count(*)::int AS c FROM competition_seasons cs
+        JOIN competitions co ON co.id = cs.competition_id
+        JOIN seasons se ON se.id = cs.season_id
+       WHERE se.year BETWEEN 2022 AND 2026`,
+    );
+    expect(links[0].c).toBe(20);
+  });
+
+  it('preserves is_current and historical import scope', async () => {
+    const current = await query<{ c: number }>(
+      `SELECT count(*)::int AS c FROM competition_seasons cs JOIN seasons se ON se.id = cs.season_id
+       WHERE se.year = 2026 AND cs.is_current = TRUE`,
+    );
+    expect(current[0].c).toBe(4); // one per competition, current season only
+    const scopeRows = await query<{ year: number; scope: string }>(
+      `SELECT DISTINCT se.year, cs.import_scope AS scope FROM competition_seasons cs
+        JOIN seasons se ON se.id = cs.season_id ORDER BY se.year`,
+    );
+    const byYear = new Map(scopeRows.map((r) => [r.year, r.scope]));
+    expect(byYear.get(2022)).toBe('out_of_scope');
+    for (const y of [2023, 2024, 2025, 2026]) expect(byYear.get(y)).toBe('in_scope');
+  });
+
+  it('is idempotent — re-import creates no duplicates', async () => {
+    const snap = async () => {
+      const [c, s, cs, co] = await Promise.all([
+        queryOne<{ c: number }>(`SELECT count(*)::int AS c FROM competitions`),
+        queryOne<{ c: number }>(`SELECT count(*)::int AS c FROM seasons`),
+        queryOne<{ c: number }>(`SELECT count(*)::int AS c FROM competition_seasons`),
+        queryOne<{ c: number }>(`SELECT count(*)::int AS c FROM countries`),
+      ]);
+      return { c: c!.c, s: s!.c, cs: cs!.c, co: co!.c };
+    };
+    const before = await snap();
+    await importCompetitions();
+    await importCompetitions();
+    const after = await snap();
+    expect(after).toEqual(before);
+  });
+
+  it('uses a bounded number of database round trips (batched, not per-row)', async () => {
+    const { pool } = await import('../src/lib/db.js');
+    const original = pool.query.bind(pool);
+    let calls = 0;
+    const counting = (text: unknown, params?: unknown) => {
+      calls += 1;
+      return original(text as never, (params ?? []) as never[]);
+    };
+    pool.query = counting as unknown as typeof pool.query;
+    try {
+      await importCompetitions();
+    } finally {
+      pool.query = original as typeof pool.query;
+    }
+    // previously this was O(leagues×seasons + competitions×years) round trips;
+    // the batched importer must stay far below that for the same payload.
+    expect(calls).toBeLessThanOrEqual(25);
+  });
+});

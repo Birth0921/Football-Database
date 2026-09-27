@@ -5,68 +5,213 @@
 import { getProvider } from '../../provider/client.js';
 import { query, queryOne } from '../../lib/db.js';
 import {
-  b, linkPlayerTeam, n, s, upsertCompetition, upsertCompetitionSeason, upsertCountry,
-  upsertPlayer, upsertReferee, upsertSeason, upsertTeam,
+  b, linkPlayerTeam, n, s, upsertPlayer, upsertReferee, upsertSeason, upsertTeam,
 } from '../../provider/mapper.js';
 import type { AfLeague, AfTeam, AfSquadEntry, AfPlayerInfo } from '../../provider/types.js';
 import { enqueueTask, upsertJob } from '../tasks.js';
 import { config } from '../../config.js';
 import { logger } from '../../lib/logger.js';
 
+/** Run `fn` over `items` with a FIXED maximum of concurrent tasks (never unbounded). */
+async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function chunk<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+/**
+ * Import every league/season returned by API-Football, plus the configured
+ * historical window, then pair competitions with seasons.
+ *
+ * Optimized to O(few) database round trips: distinct countries, seasons and
+ * competitions are extracted in memory first, then written with batched
+ * multi-row upserts; season IDs are cached in a map instead of being
+ * re-queried per pair; the competition×season pairing is a single
+ * INSERT…SELECT per chunk of years instead of two queries per pair. Chunked
+ * writes run with bounded concurrency (2) so Neon is never overwhelmed.
+ * Idempotent: re-running produces identical rows (ON CONFLICT upserts).
+ */
 export async function importCompetitions(): Promise<{ competitions: number; seasons: number }> {
+  const t0 = Date.now();
   const provider = await getProvider();
   type LeagueEntry = { league?: AfLeague } & Partial<AfLeague> & { country?: { name?: string; code?: string; flag?: string }; seasons?: { year: number; start?: string; end?: string; current?: boolean }[] };
   const res = await provider.get<LeagueEntry>('/leagues', {});
-  let comps = 0;
+  const fetchMs = Date.now() - t0;
+  const comps = res.data.response.length;
   const seasonYears = new Set<number>();
 
+  // ---- in-memory extraction (no DB round trips) -----------------------------
+  // countries: lower(name) → {name, code, flag}; first league wins for shared names
+  const countries = new Map<string, { name: string; code: string | null; flag: string | null }>();
+  // seasons: year → merged {start, end, current} (OR-merge of provider flags)
+  const seasonsByYear = new Map<number, { start: string | null; end: string | null; current: boolean }>();
+  const noteSeason = (year: number, start?: string | null, end?: string | null, current?: boolean) => {
+    const existing = seasonsByYear.get(year);
+    if (!existing) {
+      seasonsByYear.set(year, { start: s(start) ?? null, end: s(end) ?? null, current: current ?? false });
+    } else {
+      if (!existing.start && start) existing.start = s(start);
+      if (!existing.end && end) existing.end = s(end);
+      if (current) existing.current = true;
+    }
+  };
+
+  const tExtract0 = Date.now();
+  const leagueRows: { dto: AfLeague & { type?: string | null }; raw: unknown; countryName: string | null }[] = [];
   for (const entry of res.data.response) {
     const league = (entry.league ?? entry) as AfLeague;
+    const dto = { ...league, type: league.type ?? 'League' };
     const countryName = entry.country?.name ?? s(league.country) ?? null;
-    const countryId = await upsertCountry({
-      name: countryName,
-      code: entry.country?.code ?? null,
-      flag: entry.country?.flag ?? null,
-    });
-    const competitionId = await upsertCompetition(
-      { ...league, type: league.type ?? 'League' },
-      countryId,
-    );
-    comps += 1;
+    leagueRows.push({ dto, raw: dto, countryName });
+    if (countryName) {
+      const key = countryName.toLowerCase();
+      if (!countries.has(key)) {
+        countries.set(key, {
+          name: countryName,
+          code: s(entry.country?.code ?? null),
+          flag: s(entry.country?.flag ?? null),
+        });
+      }
+    }
     for (const sy of entry.seasons ?? []) {
       if (sy.year == null) continue;
       seasonYears.add(Number(sy.year));
-      const seasonId = await upsertSeason(Number(sy.year), { start: sy.start ?? null, end: sy.end ?? null, current: sy.current ?? false });
-      await upsertCompetitionSeason(competitionId, seasonId, sy.current ?? false);
+      noteSeason(Number(sy.year), sy.start ?? null, sy.end ?? null, sy.current ?? false);
     }
   }
 
-  // Ensure the standard window exists even if provider omits seasons for some leagues
+  // standard window exists even if the provider omits seasons for some leagues
   const nowYear = new Date().getUTCFullYear();
   // current season is the one starting in August of the current year (or previous if before August)
   const currentSeasonStartYear = new Date().getUTCMonth() >= 7 ? nowYear : nowYear - 1;
   for (let y = currentSeasonStartYear - config.historicalSeasonsBack; y <= currentSeasonStartYear; y++) {
     seasonYears.add(y);
-    await upsertSeason(y, { current: y === currentSeasonStartYear });
+    noteSeason(y, undefined, undefined, y === currentSeasonStartYear);
   }
+  const extractMs = Date.now() - tExtract0;
 
-  // pair every in-scope competition with the window seasons
-  const competitionRows = await query<{ id: number }>(`SELECT id FROM competitions`);
-  for (const c of competitionRows) {
-    for (const y of seasonYears) {
-      const inWindow = y > currentSeasonStartYear - config.historicalSeasonsBack - 1 && y <= currentSeasonStartYear;
-      const season = await queryOne<{ id: number }>(`SELECT id FROM seasons WHERE year = $1`, [y]);
-      if (!season) continue;
-      await query(
-        `INSERT INTO competition_seasons (competition_id, season_id, is_current, import_scope)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (competition_id, season_id) DO UPDATE SET is_current = EXCLUDED.is_current, updated_at = now()`,
-        [c.id, season.id, y === currentSeasonStartYear, inWindow ? 'in_scope' : 'out_of_scope'],
-      );
-    }
+  // ---- phase 1: batch upsert distinct seasons, then cache id per year -------
+  const tSeasons0 = Date.now();
+  const yearList = [...seasonsByYear.keys()].sort((a, z) => a - z);
+  await mapWithConcurrency(chunk(yearList, 400), 2, async (years) => {
+    await query(
+      `INSERT INTO seasons (year, display_name, start_date, end_date, is_current, provider, provider_id, raw)
+       SELECT y, y || '/' || right((y + 1)::text, 2), st, en, cur, 'api-football', y::text, '{}'::jsonb
+         FROM unnest($1::int[], $2::date[], $3::date[], $4::bool[]) AS t(y, st, en, cur)
+       ON CONFLICT (provider, provider_id) DO UPDATE SET
+         year = EXCLUDED.year, display_name = EXCLUDED.display_name,
+         start_date = EXCLUDED.start_date, end_date = EXCLUDED.end_date,
+         is_current = EXCLUDED.is_current, updated_at = now()`,
+      [
+        years,
+        years.map((y) => seasonsByYear.get(y)!.start),
+        years.map((y) => seasonsByYear.get(y)!.end),
+        years.map((y) => seasonsByYear.get(y)!.current),
+      ],
+    );
+  });
+  // cache season IDs (one query) — previously re-queried per competition×year
+  const seasonIdRows = await query<{ id: number; year: number }>(
+    `SELECT id, year FROM seasons WHERE year = ANY($1::int[])`, [yearList],
+  );
+  const seasonIdByYear = new Map<number, number>(seasonIdRows.map((r) => [r.year, r.id]));
+  const seasonsMs = Date.now() - tSeasons0;
+
+  // ---- phase 2: batch upsert distinct countries (insert-if-absent by name) --
+  const tCountries0 = Date.now();
+  const countryList = [...countries.values()];
+  if (countryList.length > 0) {
+    await query(
+      `INSERT INTO countries (name, code, flag_url, provider, raw)
+       SELECT nm, cd, fl, 'api-football', '{}'::jsonb
+         FROM unnest($1::text[], $2::text[], $3::text[]) AS t(nm, cd, fl)
+        WHERE NOT EXISTS (SELECT 1 FROM countries c WHERE lower(c.name) = lower(t.nm))`,
+      [countryList.map((c) => c.name), countryList.map((c) => c.code), countryList.map((c) => c.flag)],
+    );
   }
+  // cache country IDs (one query)
+  const countryIdRows = await query<{ id: number; lname: string }>(
+    `SELECT id, lower(name) AS lname FROM countries WHERE lower(name) = ANY($1::text[])`,
+    [countryList.map((c) => c.name.toLowerCase())],
+  );
+  const countryIdByName = new Map<string, number>(countryIdRows.map((r) => [r.lname, r.id]));
+  const countriesMs = Date.now() - tCountries0;
 
-  logger.info({ comps, seasons: seasonYears.size }, 'competitions/seasons imported');
+  // ---- phase 3: batch upsert competitions (jsonb payloads, bounded concurrency)
+  const tComps0 = Date.now();
+  const competitionPayloads = leagueRows.map(({ dto, raw, countryName }) => ({
+    name: s(dto.name) ?? 'Unknown',
+    code: s(dto.code),
+    type: s(dto.type),
+    country_id: countryName ? (countryIdByName.get(countryName.toLowerCase()) ?? null) : null,
+    logo: s(dto.logo),
+    flag: s(dto.flag),
+    national: b(dto.is_national),
+    pid: String(dto.id),
+    raw,
+  }));
+  const compIdRows = await mapWithConcurrency(chunk(competitionPayloads, 250), 2, async (rows) =>
+    query<{ id: number; provider_id: string }>(
+      `INSERT INTO competitions (name, code, type, country_id, logo_url, flag_url, is_national, provider, provider_id, raw)
+       SELECT r.name, r.code, r.type, r.country_id, r.logo, r.flag, r.national, 'api-football', r.pid, r.raw
+         FROM jsonb_to_recordset($1::jsonb)
+         AS r(name text, code text, type text, country_id bigint, logo text, flag text, national boolean, pid text, raw jsonb)
+       ON CONFLICT (provider, provider_id) DO UPDATE SET
+         name = EXCLUDED.name, code = EXCLUDED.code, type = EXCLUDED.type,
+         country_id = EXCLUDED.country_id, logo_url = EXCLUDED.logo_url, flag_url = EXCLUDED.flag_url,
+         is_national = EXCLUDED.is_national, raw = EXCLUDED.raw, updated_at = now()
+       RETURNING id, provider_id`,
+      [JSON.stringify(rows)],
+    ),
+  );
+  const compsMs = Date.now() - tComps0;
+
+  // ---- phase 4: pair ALL competitions × known season years ------------------
+  // One INSERT…SELECT per chunk of years (cross join in SQL, not per-pair
+  // round trips). is_current is (year = current window start); import_scope is
+  // preserved for existing rows (not updated on conflict) — exactly the
+  // previous semantics.
+  const tPair0 = Date.now();
+  const scopeFloor = currentSeasonStartYear - config.historicalSeasonsBack - 1;
+  let pairedRows = 0;
+  const pairingResults = await mapWithConcurrency(chunk(yearList, 12), 2, async (years) =>
+    query<{ c: number }>(
+      `WITH ins AS (
+         INSERT INTO competition_seasons (competition_id, season_id, is_current, import_scope)
+         SELECT c.id, s.id, (s.year = $1),
+                CASE WHEN s.year > $2 AND s.year <= $1 THEN 'in_scope' ELSE 'out_of_scope' END
+           FROM competitions c CROSS JOIN seasons s
+          WHERE s.year = ANY($3::int[])
+         ON CONFLICT (competition_id, season_id) DO UPDATE SET is_current = EXCLUDED.is_current, updated_at = now()
+         RETURNING 1)
+       SELECT count(*)::int AS c FROM ins`,
+      [currentSeasonStartYear, scopeFloor, years],
+    ),
+  );
+  pairedRows = pairingResults.reduce((sum, r) => sum + (r[0]?.c ?? 0), 0);
+  const pairMs = Date.now() - tPair0;
+
+  logger.info({
+    comps,
+    seasons: seasonYears.size,
+    countries: countryList.length,
+    newPairRows: pairedRows,
+    timingMs: { fetch: fetchMs, extract: extractMs, seasons: seasonsMs, countries: countriesMs, competitions: compsMs, pairing: pairMs, total: Date.now() - t0 },
+  }, 'competitions/seasons imported (batched)');
   return { competitions: comps, seasons: seasonYears.size };
 }
 
