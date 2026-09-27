@@ -1,21 +1,21 @@
 name: VPS deploy
 
 # Deploys the platform to the production VPS over SSH.
-# Triggered by a push that touches .deploy/DEPLOY (which contains the
-# one-time credential-drop URL). The drop serves the SSH key + production
-# .env from an unguessable, HTTPS, session-scoped endpoint and is deleted
-# after use. No secrets live in the repo.
+# Triggered by a push that touches .deploy/GO.
+# Credentials come from encrypted repository secrets (VPS_SSH_KEY,
+# VPS_ENV) — never from repo content. The run report is pushed back to
+# .deploy/logs/ so the deploy can be monitored via git fetch.
 on:
   push:
     branches: [arena/01a0d445-football-database]
-    paths: ['.deploy/DEPLOY']
+    paths: ['.deploy/GO']
 
 concurrency:
   group: vps-deploy
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   deploy:
@@ -28,15 +28,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch credentials from one-time drop
+      - name: Install SSH key
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
         run: |
-          BASE=$(tr -d '[:space:]' < .deploy/DEPLOY)
-          echo "credential drop: $BASE"
-          curl -fsSL --retry 3 --retry-delay 2 "$BASE/vps_key" -o ~/.ssh/vps_key
-          curl -fsSL --retry 3 --retry-delay 2 "$BASE/env" -o /tmp/prod.env
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/vps_key
           chmod 600 ~/.ssh/vps_key
           ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
-          echo "credentials fetched (ssh key + production env)"
 
       - name: Transfer code
         run: |
@@ -45,23 +44,47 @@ jobs:
           echo "code transferred"
 
       - name: Write production .env (server-side only)
+        env:
+          VPS_ENV: ${{ secrets.VPS_ENV }}
         run: |
-          cat /tmp/prod.env | ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cat > $APP_DIR/.env && chmod 600 $APP_DIR/.env"
-          rm -f /tmp/prod.env
-          echo ".env written on server (mode 600)"
+          printf '%s\n' "$VPS_ENV" | ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cat > $APP_DIR/.env && chmod 600 $APP_DIR/.env"
+          echo ".env written on the server (mode 600)"
 
       - name: Deploy (docker install, build, start, migrate, health-wait)
         run: |
-          ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cd $APP_DIR && bash scripts/deploy/vps-deploy.sh"
+          ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cd $APP_DIR && bash scripts/deploy/vps-deploy.sh" 2>&1 | tee /tmp/deploy.log
 
       - name: "Verify from the VPS (doctor: Postgres / Redis / API-Football)"
         run: |
-          ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cd $APP_DIR && bash scripts/deploy/vps-verify.sh" || true
+          ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cd $APP_DIR && bash scripts/deploy/vps-verify.sh" 2>&1 | tee /tmp/verify.log || true
 
       - name: Verify from the public internet
         run: |
-          echo "--- public checks (http://$VPS_HOST/) ---"
-          for p in / /admin/api-keys /api/v1/docs /api/v1/health /api/v1/health/data; do
-            code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 "http://$VPS_HOST$p")
-            echo "GET $p -> $code"
-          done
+          { echo "--- public checks (http://$VPS_HOST/) ---"
+            for p in / /admin/api-keys /api/v1/docs /api/v1/health /api/v1/health/data; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 "http://$VPS_HOST$p")
+              echo "GET $p -> $code"
+            done ; } | tee /tmp/public.log
+
+      - name: Publish run report to the repo
+        if: always()
+        run: |
+          git config user.name "deploy-bot"
+          git config user.email "deploy-bot@users.noreply.github.com"
+          mkdir -p .deploy/logs
+          { echo "deploy run: $GITHUB_RUN_URL"
+            echo "finished: $(date -u +%FT%TZ)"
+            echo
+            echo "=== deploy tail ==="
+            tail -n 25 /tmp/deploy.log 2>/dev/null
+            echo
+            echo "=== verify (doctor) ==="
+            cat /tmp/verify.log 2>/dev/null
+            echo
+            echo "=== public checks ==="
+            cat /tmp/public.log 2>/dev/null
+          } | sed -E 's/pf_live_[A-Za-z0-9_-]+/[REDACTED pf_live]/g; s/eyJ[A-Za-z0-9._-]{10,}/[REDACTED jwt]/g' \
+            > ".deploy/logs/deploy-$(date -u +%Y%m%dT%H%M%S).log"
+          git add .deploy/logs
+          git commit -m "deploy run report (bot)" || echo "nothing to report"
+          git push
