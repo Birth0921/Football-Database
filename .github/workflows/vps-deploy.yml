@@ -4,7 +4,7 @@ name: VPS deploy
 # Triggered by a push that touches .deploy/GO.
 # Credentials come from encrypted repository secrets (VPS_SSH_KEY,
 # VPS_ENV) — never from repo content. The run report is pushed back to
-# .deploy/logs/ so the deploy can be monitored via git fetch.
+# .deploy/reports/ so the deploy can be monitored via git fetch.
 on:
   push:
     branches: [arena/01a0d445-football-database]
@@ -85,7 +85,7 @@ jobs:
         run: |
           git config user.name "deploy-bot"
           git config user.email "deploy-bot@users.noreply.github.com"
-          mkdir -p .deploy/logs
+          mkdir -p .deploy/reports
           { echo "deploy run: $GITHUB_RUN_URL"
             echo "finished: $(date -u +%FT%TZ)"
             echo
@@ -98,7 +98,7 @@ jobs:
             echo "=== public checks ==="
             cat /tmp/public.log 2>/dev/null
           } | sed -E 's/pf_live_[A-Za-z0-9_-]+/[REDACTED pf_live]/g; s/eyJ[A-Za-z0-9._-]{10,}/[REDACTED jwt]/g' \
-            > ".deploy/logs/deploy-$(date -u +%Y%m%dT%H%M%S).log"
-          git add .deploy/logs
+            > ".deploy/reports/deploy-$(date -u +%Y%m%dT%H%M%S).log"
+          git add .deploy/reports
           git commit -m "deploy run report (bot)" || echo "nothing to report"
           git push

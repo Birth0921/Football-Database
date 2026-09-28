@@ -3,7 +3,7 @@ name: VPS exec
 # Remote control channel: runs the bash command contained in .deploy/command
 # on the production VPS (in /opt/football-platform). Used for data bootstrap,
 # monitoring and ops. Triggered by a push that touches .deploy/command.
-# The output report is pushed to .deploy/logs/ (secrets redacted).
+# The output report is pushed to .deploy/reports/ (secrets redacted).
 on:
   push:
     branches: [arena/01a0d445-football-database]
@@ -45,9 +45,9 @@ jobs:
         run: |
           git config user.name "exec-bot"
           git config user.email "exec-bot@users.noreply.github.com"
-          mkdir -p .deploy/logs
+          mkdir -p .deploy/reports
           sed -E 's/pf_live_[A-Za-z0-9_-]+/[REDACTED pf_live]/g; s/eyJ[A-Za-z0-9._-]{10,}/[REDACTED jwt]/g' \
-            /tmp/exec.log > ".deploy/logs/exec-$(date -u +%Y%m%dT%H%M%S).log"
-          git add .deploy/logs
+            /tmp/exec.log > ".deploy/reports/exec-$(date -u +%Y%m%dT%H%M%S).log"
+          git add .deploy/reports
           git commit -m "exec run report (bot)" || echo "nothing to report"
           git push

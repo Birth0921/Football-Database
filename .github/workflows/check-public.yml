@@ -2,7 +2,7 @@ name: Public check
 
 # Secrets-free external verification: hits the public endpoints of the
 # production VPS from a GitHub runner and commits the results to
-# .deploy/logs/ (readable via git fetch). No credentials involved.
+# .deploy/reports/ (readable via git fetch). No credentials involved.
 on:
   push:
     branches: [arena/01a0d445-football-database]
@@ -45,8 +45,8 @@ jobs:
         run: |
           git config user.name "check-bot"
           git config user.email "check-bot@users.noreply.github.com"
-          mkdir -p .deploy/logs
-          cp /tmp/check.txt ".deploy/logs/check-$(date -u +%Y%m%dT%H%M%S).txt"
-          git add .deploy/logs
+          mkdir -p .deploy/reports
+          cp /tmp/check.txt ".deploy/reports/check-$(date -u +%Y%m%dT%H%M%S).txt"
+          git add .deploy/reports
           git commit -m "public check result (bot)" || echo "nothing to commit"
           git push
