@@ -1,0 +1,15 @@
+public check at 2026-09-28T18:51:36Z
+GET / -> 200
+GET /admin/api-keys -> 200
+GET /api/v1/docs -> 200
+GET /api/v1/health -> 200
+GET /api/v1/health/data -> 200
+--- /api/v1/health body:
+{"ok":true,"status":"alive","time":"2026-09-28T18:51:38.752Z","providerMode":"live"}
+
+--- /api/v1/health/data body:
+{"ok":true,"status":"PASS","checks":[{"key":"fixtures_teams_distinct","status":"PASS","message":"0 fixtures with home = away"},{"key":"completed_fixtures_have_scores","status":"PASS","message":"0 completed fixtures without any score"},{"key":"events_reference_fixtures","status":"PASS","message":"0 orphan fixture events"},{"key":"player_stats_reference_players","status":"PASS","message":"0 player-match-stat rows without player"},{"key":"provider_fixture_ids_unique","status":"PASS","message":"0 duplicate provider fixture ids"},{"key":"standings_reference_competition_season","status":"PASS","mess
+
+--- /api/v1/fixtures (anonymous via website proxy; total must be > 0):
+{"ok":true,"data":[],"pagination":{"page":1,"per_page":1,"total":0,"total_pages":1}}
+
