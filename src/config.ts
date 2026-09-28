@@ -37,22 +37,50 @@ function bool(name: string, def: boolean): boolean {
   return ['1', 'true', 'yes', 'on'].includes(v.toLowerCase());
 }
 
-/** The production importer is intentionally pinned to this four-season window. */
-export const IMPORT_SEASONS = [2023, 2024, 2025, 2026] as const;
-export const CURRENT_IMPORT_SEASON = 2026 as const;
+/**
+ * Rolling 4-season import window.
+ *
+ * The current season is the UTC calendar year (rollover on 1 January UTC):
+ *   2026 → 2023, 2024, 2025, 2026
+ *   2027 → 2024, 2025, 2026, 2027
+ *   2028 → 2025, 2026, 2027, 2028   … and so on automatically.
+ * January is used so calendar-year leagues (MLS, Brasileirão, J-League, …)
+ * enter the window when their season starts, while an August–May season
+ * (e.g. 2026/27 = provider season 2026) stays inside the window until it ends.
+ * Seasons outside the window are never imported.
+ */
+export const IMPORT_WINDOW_SIZE = 4;
 
-/** Strict allowlist parser: anything other than exactly 2023,2024,2025,2026 is rejected. */
-export function parseImportSeasons(raw: string = process.env.IMPORT_SEASONS ?? IMPORT_SEASONS.join(',')): number[] {
-  const values = raw.split(',').map((part) => Number(part.trim()));
-  if (values.length !== IMPORT_SEASONS.length || values.some((year) => !Number.isInteger(year))) {
-    throw new Error(`IMPORT_SEASONS must be exactly ${IMPORT_SEASONS.join(',')}`);
+export function currentSeasonFor(now: Date = new Date()): number {
+  return now.getUTCFullYear();
+}
+
+export function rollingSeasonWindow(current: number = currentSeasonFor()): number[] {
+  return Array.from({ length: IMPORT_WINDOW_SIZE }, (_, i) => current - (IMPORT_WINDOW_SIZE - 1) + i);
+}
+
+let warnedImportSeasonsEnv = false;
+
+/**
+ * IMPORT_SEASONS can no longer widen or pin the window. Accepted values:
+ * unset, "rolling", or an explicit list that equals the current rolling
+ * window. Any other value is ignored with a one-time warning (never an error,
+ * so a stale value cannot stop the service at a season rollover); the rolling
+ * window is always what is used.
+ */
+export function parseImportSeasons(raw: string | undefined = process.env.IMPORT_SEASONS, now: Date = new Date()): number[] {
+  const window = rollingSeasonWindow(currentSeasonFor(now));
+  const value = (raw ?? '').trim().toLowerCase();
+  if (value === '' || value === 'rolling') return window;
+  const years = value.split(',').map((p) => Number(p.trim()));
+  const matches = years.length === window.length && years.every((y) => Number.isInteger(y))
+    && new Set(years).size === window.length && years.every((y) => window.includes(y));
+  if (!matches && !warnedImportSeasonsEnv) {
+    warnedImportSeasonsEnv = true;
+    // eslint-disable-next-line no-console
+    console.warn(`[config] IMPORT_SEASONS="${raw}" ignored — using rolling window ${window.join(',')}`);
   }
-  const expected = new Set<number>(IMPORT_SEASONS);
-  const actual = new Set(values);
-  if (actual.size !== expected.size || values.some((year) => !expected.has(year))) {
-    throw new Error(`IMPORT_SEASONS must be exactly ${IMPORT_SEASONS.join(',')}`);
-  }
-  return [...IMPORT_SEASONS];
+  return window;
 }
 
 export const config = {
@@ -76,10 +104,16 @@ export const config = {
   // floor: max(2x essential reserve, PROVIDER_BACKGROUND_FLOOR_PERCENT% of quota).
   providerEssentialReserve: num('PROVIDER_ESSENTIAL_RESERVE', 0),
   providerBackgroundFloorPercent: num('PROVIDER_BACKGROUND_FLOOR_PERCENT', 20),
-  // IMPORT_SEASONS is strict: no provider season outside 2023–2026 may enter
-  // the import scope, regardless of what /leagues returns.
-  importSeasons: parseImportSeasons(),
-  currentImportSeason: CURRENT_IMPORT_SEASON,
+  // No provider season outside the rolling window may enter the import scope,
+  // regardless of what /leagues returns.
+  /** Rolling 4-season window, evaluated on every access (no restart needed at rollover). */
+  get importSeasons(): number[] {
+    return parseImportSeasons();
+  },
+  /** Current season (UTC calendar year), evaluated on every access. */
+  get currentImportSeason(): number {
+    return currentSeasonFor();
+  },
   historicalSeasonsBack: num('HISTORICAL_SEASONS_BACK', 3),
   syncLiveIntervalSeconds: num('SYNC_LIVE_INTERVAL_SECONDS', 60),
   syncUpcomingIntervalSeconds: num('SYNC_UPCOMING_INTERVAL_SECONDS', 900),

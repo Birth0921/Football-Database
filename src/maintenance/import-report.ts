@@ -24,7 +24,7 @@ export interface ImportScopeReport {
     outsideTier1to3Active: number;
     required: { providerId: string; name: string; present: boolean; active: boolean }[];
   };
-  seasons: { inScope: number[]; outOfScopeRows: number; current: number };
+  seasons: { window: number[]; inScope: number[]; outOfScopeRows: number; current: number };
   competitionSeasons: {
     inScope: number;
     byYear: Record<string, number>;
@@ -64,7 +64,9 @@ export async function buildImportScopeReport(): Promise<ImportScopeReport> {
   const reqMap = new Map(reqRows.map((r) => [r.provider_id, r]));
 
   const inScopeSeasons = await query<{ year: number }>(`SELECT year FROM seasons WHERE import_scope = 'in_scope' AND year = ANY($1::int[]) ORDER BY year`, [years]);
-  const outSeasons = await queryOne<{ c: number }>(`SELECT count(*)::int AS c FROM seasons WHERE NOT (year = ANY($1::int[]))`, [years]);
+  // seasons outside the window that are still (wrongly) marked in scope; rows of
+  // seasons that left the window are retained as out_of_scope and not counted
+  const outSeasons = await queryOne<{ c: number }>(`SELECT count(*)::int AS c FROM seasons WHERE import_scope = 'in_scope' AND NOT (year = ANY($1::int[]))`, [years]);
 
   const pairBase = `FROM competition_seasons cs JOIN competitions c ON c.id = cs.competition_id JOIN seasons se ON se.id = cs.season_id
                     WHERE cs.import_scope = 'in_scope' AND ${activeWhere}`;
@@ -136,7 +138,7 @@ export async function buildImportScopeReport(): Promise<ImportScopeReport> {
         active: Boolean(reqMap.get(r.providerId)?.active && reqMap.get(r.providerId)?.import_tier),
       })),
     },
-    seasons: { inScope: inScopeSeasons.map((r) => r.year), outOfScopeRows: outSeasons?.c ?? 0, current: config.currentImportSeason },
+    seasons: { window: years, inScope: inScopeSeasons.map((r) => r.year), outOfScopeRows: outSeasons?.c ?? 0, current: config.currentImportSeason },
     competitionSeasons: {
       inScope: pairs?.total ?? 0,
       byYear: toMap(pairsByYear),

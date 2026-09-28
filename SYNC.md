@@ -148,3 +148,36 @@ target exists and is in scope: active competition with tier 1–3, season in
   `cleanupImportScope` and migration `0005` do the same.
 - `claimDueTasks` returns each batch in strict priority order: live 10 → upcoming 20 →
   recent 22 → post-match 25 → 2026 bootstrap 35 → history 55.
+
+## Rolling 4-season window and automatic season transition
+
+The current season is the UTC calendar year and the import window is always
+the current season plus the three before it:
+
+| current | window |
+|---|---|
+| 2026 | 2023, 2024, 2025, 2026 |
+| 2027 | 2024, 2025, 2026, 2027 |
+| 2028 | 2025, 2026, 2027, 2028 |
+
+The config reads the clock on every access, so no restart or config change is needed.
+At the first scheduler cycle of a new year, a single `season-transition:<year>`
+task runs. The key is unique per year, so a restart never repeats it. The task:
+
+1. refreshes the approved Tier 1–3 catalogue (one request). The new season enters
+   the window. The season that falls out becomes `out_of_scope`, but its stored
+   fixtures and statistics are **kept**, because no retention policy deletes data.
+2. promotes the former current season to historical: `historical_imported_at` is
+   set from `current_bootstrapped_at`, so it is **never re-imported in full**.
+3. queues the one-time bootstrap for the new current season only (priority 35).
+
+A bootstrap that returns no fixtures yet (schedule not published) records
+`current_bootstrap_attempted_at` and is retried at most weekly.
+`current_bootstrapped_at` is set once fixtures exist.
+
+Live, today, upcoming and recent-finished sync request by **date**. It stores fixtures for
+approved competitions in any window season, at the same cost. An August–May season
+(for example 2026/27, provider season 2026) therefore keeps syncing until its last
+match after the January rollover, while calendar-year leagues start their new
+season on time. January was chosen as the rollover because it serves both kinds of league.
+Provider-wide imports and seasons outside the window are never allowed.

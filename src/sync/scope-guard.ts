@@ -6,7 +6,7 @@
  * reference data that is still inside the approved import scope:
  *   - competition active with import tier 1..3 (set only by the importer from
  *     the approved Tier 1–3 table; cleared by cleanupImportScope)
- *   - season year in IMPORT_SEASONS (exactly 2023–2026) and marked in_scope
+ *   - season year inside the rolling 4-season window and marked in_scope
  *   - competition_seasons pair marked in_scope
  *
  * Work that falls outside that scope can never succeed by retrying, so it is

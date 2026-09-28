@@ -5,11 +5,11 @@
  * bootstrap, current sync, priorities, quota backoff, duplicate prevention,
  * restart recovery, scope report).
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { registerAllHandlers } from '../src/sync/handlers.js';
 import { closePool, query, queryOne } from '../src/lib/db.js';
 import { closeRedis } from '../src/lib/redis.js';
-import { enqueueSeasonWindowTasks, importCompetitions } from '../src/sync/pipelines/metadata.js';
+import { cleanupImportScope, enqueueSeasonWindowTasks, importCompetitions } from '../src/sync/pipelines/metadata.js';
 import { importFixturesForCompetitionSeason, syncUpcomingFixtures } from '../src/sync/pipelines/fixtures.js';
 import { claimDueTasks, claimTaskById, enqueueTask, getTaskByKey, requeueStuckTasks } from '../src/sync/tasks.js';
 import { drainDueTasks, processTask } from '../src/sync/engine.js';
@@ -213,7 +213,7 @@ describe('clean rebuild after reset', () => {
   it('rebuilds only approved competitions with seasons 2023–2026 and stores the profile', async () => {
     await importCompetitions();
     const report = await buildImportScopeReport();
-    expect(report.seasons.inScope).toEqual([2023, 2024, 2025, 2026]);
+    expect(report.seasons.inScope).toEqual([2023, 2024, 2025, 2026]); // rolling window while the current season is 2026
     expect(report.seasons.outOfScopeRows).toBe(0);
     expect(report.competitions.active).toBe(4); // mock catalogue: 4 approved entries
     expect(report.competitions.outsideTier1to3Active).toBe(0);
@@ -353,5 +353,52 @@ describe('clean rebuild after reset', () => {
     expect((await getTaskByKey('teams:1363:18'))!.status).toBe('skipped');
     const report = await buildImportScopeReport();
     expect(report.tasks.queuedOutOfScope).toBe(0);
+  });
+
+  it('automatic rollover 2026 → 2027: former current becomes historical without re-import, oldest season leaves scope, data kept', async () => {
+    const fixturesBefore = await count('fixtures');
+    const s2023 = await queryOne<{ id: number }>(`SELECT id FROM seasons WHERE year = 2023`);
+    const fx2023 = (await queryOne<{ c: number }>(`SELECT count(*)::int AS c FROM fixtures WHERE season_id = $1`, [s2023!.id]))!.c;
+    expect(fx2023).toBeGreaterThan(0);
+
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2027-01-01T00:05:00Z'));
+    try {
+      const { config } = await import('../src/config.js');
+      expect(config.currentImportSeason).toBe(2027);
+      expect(config.importSeasons).toEqual([2024, 2025, 2026, 2027]);
+
+      const res = await cleanupImportScope();
+      expect(res.promotedToHistorical).toBe(4); // the four 2026 pairs bootstrapped earlier
+
+      // 2023 is outside the window: out of scope, but its data is retained
+      const season2023 = await queryOne<{ import_scope: string }>(`SELECT import_scope FROM seasons WHERE year = 2023`);
+      expect(season2023!.import_scope).toBe('out_of_scope');
+      expect((await queryOne<{ c: number }>(`SELECT count(*)::int AS c FROM fixtures WHERE season_id = $1`, [s2023!.id]))!.c).toBe(fx2023);
+      expect(await count('fixtures')).toBe(fixturesBefore);
+
+      // 2026 is now historical and already imported → never re-queued in full
+      const s2026 = await queryOne<{ id: number; is_current: boolean }>(`SELECT id, is_current FROM seasons WHERE year = 2026`);
+      expect(s2026!.is_current).toBe(false);
+      await enqueueSeasonWindowTasks();
+      const requeued2026 = await query(
+        `SELECT 1 FROM sync_tasks WHERE task_type = 'fixtures:import' AND status = 'pending' AND (params->>'seasonId')::bigint = $1`,
+        [s2026!.id],
+      );
+      expect(requeued2026.length).toBe(0);
+      const comp = await queryOne<{ id: number }>(`SELECT id FROM competitions WHERE provider_id = '39'`);
+      const before = await providerRequests();
+      const again = await importFixturesForCompetitionSeason(comp!.id, s2026!.id, { fetchDetails: false });
+      expect(again.alreadyImported).toBe(true);
+      expect(await providerRequests()).toBe(before);
+
+      // tasks for the dropped season are rejected
+      expect(await enqueueTask({ taskKey: `test:rollover:2023:${Date.now()}`, taskType: 'teams:import', params: { competitionId: comp!.id, seasonId: s2023!.id } })).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      await cleanupImportScope(); // back to the real window
+    }
+    const back = await queryOne<{ import_scope: string }>(`SELECT import_scope FROM seasons WHERE year = 2023`);
+    expect(back!.import_scope).toBe('in_scope');
   });
 });

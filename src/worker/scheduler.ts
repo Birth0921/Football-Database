@@ -18,6 +18,30 @@ import { skipOutOfScopeTasks } from '../sync/scope-guard.js';
 let lastQuotaReconcile = 0;
 let bootstrapTaskKey: string | null = null;
 let lastScopeSweep = 0;
+let lastSeasonSeen: number | null = null;
+
+/**
+ * Automatic rolling-window transition. The current season is the UTC year,
+ * read on every cycle, so at 00:00 UTC on 1 January (or on the first cycle
+ * after a restart) a single `season-transition:<year>` task is queued. Its
+ * handler refreshes the approved catalogue — which re-scopes the window
+ * (new season in, oldest season out_of_scope with its data retained),
+ * promotes the former current season to historical without re-importing it,
+ * and queues the bootstrap for the new current season only. The task key is
+ * unique per year, so restarts never repeat a completed transition.
+ */
+async function ensureSeasonTransition(): Promise<void> {
+  const season = config.currentImportSeason;
+  if (lastSeasonSeen === season) return;
+  lastSeasonSeen = season;
+  await enqueueTask({
+    taskKey: `season-transition:${season}`,
+    taskType: 'season-window:enqueue',
+    params: { season, window: config.importSeasons },
+    priority: 15,
+  });
+  logger.info({ season, window: config.importSeasons }, 'rolling season window checked');
+}
 
 /**
  * Stop stale queued work (e.g. `teams:import` for a competition/season that no
@@ -36,6 +60,7 @@ async function scheduleCycle(): Promise<void> {
   const windowKey = `cycle:${Math.floor(now / 60_000)}`;
   await upsertJob(windowKey, 'scheduler', {}, 10);
   await sweepOutOfScopeTasks(now).catch((err) => logger.warn({ err: (err as Error).message }, 'scope sweep failed'));
+  await ensureSeasonTransition().catch((err) => logger.warn({ err: (err as Error).message }, 'season transition check failed'));
 
   // A clean production database has no in-scope pairs after migrations. Queue
   // one current refresh so the handler can initialise metadata and populate
@@ -77,8 +102,8 @@ async function scheduleCycle(): Promise<void> {
        JOIN competition_seasons cs ON cs.competition_id = f.competition_id AND cs.season_id = f.season_id
       WHERE f.status_short IN ('1H','HT','2H','ET','BT','P','INT')
         AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
-        AND se.year = $1 AND se.import_scope = 'in_scope' AND cs.import_scope = 'in_scope'`,
-    [config.currentImportSeason],
+        AND se.year = ANY($1::int[]) AND se.import_scope = 'in_scope' AND cs.import_scope = 'in_scope'`,
+    [config.importSeasons],
   );
   const day = new Date().getUTCDay();
   const hour = new Date().getUTCHours();

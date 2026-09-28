@@ -47,7 +47,7 @@ function chunk<T>(items: T[], size: number): T[][] {
  * shared teams, players, referees or venues. Foreign-keyed fixture/stat rows
  * remain valid and are simply hidden from the active import scope.
  */
-export async function cleanupImportScope(approvedIds?: string[]): Promise<{ disabledCompetitions: number; outOfScopeCompetitionSeasons: number; outOfScopeSeasons: number; skippedTasks: number }> {
+export async function cleanupImportScope(approvedIds?: string[]): Promise<{ promotedToHistorical: number; disabledCompetitions: number; outOfScopeCompetitionSeasons: number; outOfScopeSeasons: number; skippedTasks: number }> {
   const allowedIds = approvedIds ?? approvedProviderIds(config.providerMode === 'mock');
   const years = config.importSeasons;
   const result = await withTransaction(async (client) => {
@@ -83,8 +83,20 @@ export async function cleanupImportScope(approvedIds?: string[]): Promise<{ disa
            OR cs.is_current IS DISTINCT FROM (se.year = $1))`,
       [config.currentImportSeason],
     );
-    await client.query(`UPDATE competition_seasons SET historical_imported_at = NULL WHERE import_scope = 'out_of_scope'`);
+    // Season rollover: a former current season that was bootstrapped once is
+    // now historical and already imported — carry its marker over so it is
+    // NEVER re-imported in full. Markers of seasons that left the window are
+    // kept too (their data is retained, only marked out_of_scope).
+    const promoted = await client.query(
+      `UPDATE competition_seasons cs
+          SET historical_imported_at = cs.current_bootstrapped_at, updated_at = now()
+         FROM seasons se
+        WHERE se.id = cs.season_id AND se.year <> $1
+          AND cs.historical_imported_at IS NULL AND cs.current_bootstrapped_at IS NOT NULL`,
+      [config.currentImportSeason],
+    );
     return {
+      promotedToHistorical: promoted.rowCount ?? 0,
       disabledCompetitions: disabled.rowCount ?? 0,
       outOfScopeCompetitionSeasons: pairs.rowCount ?? 0,
       outOfScopeSeasons: seasons.rowCount ?? 0,
@@ -175,8 +187,8 @@ export async function importCompetitions(): Promise<{ competitions: number; seas
     }
   }
 
-  // Ensure every requested season exists even when the provider omits it from
-  // an individual league's catalogue.  2026 is the only current season.
+  // Ensure every window season exists even when the provider omits it from
+  // an individual league's catalogue. Only the current season is is_current.
   for (const year of config.importSeasons) {
     noteSeason(year, undefined, undefined, year === config.currentImportSeason);
   }
@@ -534,18 +546,22 @@ export async function importSeasonsCli(): Promise<{ seasons: number }> {
 }
 
 /**
- * Enqueue the ONE-TIME fixture import for every in-scope pair that has not
- * been imported yet:
- *   - 2026 (current) pairs without `current_bootstrapped_at` → priority 35
- *     (after live 10 / upcoming 20 / recent 22 / post-match 25)
- *   - 2023–2025 pairs without `historical_imported_at`       → priority 55
- * Both are quota class "background", so they are deferred with backoff when
- * quota is constrained while live/current sync keeps running. Already
- * imported pairs are never re-queued. Coverage/teams/standings follow-ups are
- * chained by fixtures:import only for pairs that actually have fixtures.
+ * Enqueue the ONE-TIME fixture import for every in-scope pair of the rolling
+ * window that has not been imported yet:
+ *   - current season pairs without `current_bootstrapped_at` → priority 35
+ *     (after live 10 / upcoming 20 / recent 22 / post-match 25). A bootstrap
+ *     that found no fixtures yet (schedule not published) is retried at most
+ *     weekly via `current_bootstrap_attempted_at`.
+ *   - historical window pairs with neither `historical_imported_at` nor
+ *     `current_bootstrapped_at` → priority 55. A former current season that
+ *     was bootstrapped is promoted, never re-imported in full.
+ * Both are quota class "background": deferred with backoff when quota is
+ * constrained while live/current sync keeps running. Coverage/teams/standings
+ * follow-ups are chained by fixtures:import only for pairs with fixtures.
  */
 export async function enqueueSeasonWindowTasks(): Promise<{ tasks: number; current: number; historical: number }> {
-  const historicalSeasons = historicalImportSeasons(config.importSeasons);
+  const currentSeason = config.currentImportSeason;
+  const historicalSeasons = historicalImportSeasons(config.importSeasons, currentSeason);
   const rows = await query<{ competition_id: number; season_id: number; year: number }>(
     `SELECT cs.competition_id, cs.season_id, se.year
        FROM competition_seasons cs
@@ -554,19 +570,24 @@ export async function enqueueSeasonWindowTasks(): Promise<{ tasks: number; curre
       WHERE cs.import_scope = 'in_scope' AND se.import_scope = 'in_scope'
         AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
         AND (
-          (se.year = ANY($1::int[]) AND cs.historical_imported_at IS NULL)
-          OR (se.year = $2 AND cs.current_bootstrapped_at IS NULL)
+          (se.year = ANY($1::int[]) AND cs.historical_imported_at IS NULL AND cs.current_bootstrapped_at IS NULL)
+          OR (se.year = $2 AND cs.current_bootstrapped_at IS NULL
+              AND (cs.current_bootstrap_attempted_at IS NULL OR cs.current_bootstrap_attempted_at < now() - interval '7 days'))
         )
       ORDER BY se.year DESC, c.import_tier ASC, cs.competition_id ASC`,
-    [historicalSeasons, config.currentImportSeason],
+    [historicalSeasons, currentSeason],
   );
   const jobId = await upsertJob(`season-window:${new Date().toISOString().slice(0, 10)}`, 'metadata', { count: rows.length }, 20);
+  // ISO-week bucket: one bootstrap attempt per pair per week at most.
+  const week = Math.floor(Date.now() / (7 * 864e5));
   let current = 0;
   let historical = 0;
   for (const r of rows) {
-    const isCurrent = r.year === config.currentImportSeason;
+    const isCurrent = r.year === currentSeason;
     const id = await enqueueTask({
-      taskKey: `fixtures:import:${r.competition_id}:${r.season_id}`,
+      taskKey: isCurrent
+        ? `fixtures:bootstrap:${r.competition_id}:${r.season_id}:w${week}`
+        : `fixtures:import:${r.competition_id}:${r.season_id}`,
       taskType: 'fixtures:import',
       params: { competitionId: Number(r.competition_id), seasonId: Number(r.season_id) },
       priority: isCurrent ? 35 : 55,

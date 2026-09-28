@@ -60,9 +60,9 @@ export interface ImportFixturesResult {
   completed: number;
   enqueuedDetails: number;
   /**
-   * true when the pair was already imported once (2023–2025 historical or the
-   * one-time 2026 bootstrap) and was served from PostgreSQL with no provider
-   * request. Continuous 2026 updates come from live/upcoming/recent sync.
+   * true when the pair was already imported once (historical window season or
+   * the one-time current-season bootstrap) and was served from PostgreSQL with
+   * no provider request. Continuous updates come from live/upcoming/recent sync.
    */
   alreadyImported?: boolean;
 }
@@ -72,12 +72,13 @@ export async function importFixturesForCompetitionSeason(competitionId: number, 
   const provider = await getProvider();
   const ids = await resolveScopedPair(competitionId, seasonId);
 
-  // One-time import per pair: a completed historical window (2023–2025) is
-  // immutable and the 2026 season is bootstrapped once, after which only the
+  // One-time import per pair: a historical window season is imported once and
+  // the current season is bootstrapped once, after which only the
   // live/today/upcoming/recent windows are requested. `force` is reserved for
   // explicit operator CLI refreshes.
   const current = isCurrentImportSeason(ids.season_year);
-  const marker = current ? ids.current_bootstrapped_at : ids.historical_imported_at;
+  // A former current season that was bootstrapped counts as imported.
+  const marker = current ? ids.current_bootstrapped_at : (ids.historical_imported_at ?? ids.current_bootstrapped_at);
   if (marker && !opts.force) {
     const existing = await queryOne<{ c: number }>(
       `SELECT count(*)::int AS c FROM fixtures WHERE competition_id = $1 AND season_id = $2`,
@@ -129,10 +130,19 @@ export async function importFixturesForCompetitionSeason(competitionId: number, 
     }
     await invalidateFixture(up.fixtureId);
   }
+  // Historical: marked imported even when empty (a finished season with no
+  // fixtures has none to fetch). Current: only marked bootstrapped once the
+  // provider actually returned fixtures; an empty answer (schedule not yet
+  // published at the start of a new season) records the attempt so the
+  // bootstrap is retried at most weekly instead of looping.
+  const bootstrapped = !current || res.data.response.length > 0;
   await query(
     current
-      ? `UPDATE competition_seasons SET current_bootstrapped_at = now(), updated_at = now()
-          WHERE competition_id = $1 AND season_id = $2 AND import_scope = 'in_scope'`
+      ? (bootstrapped
+        ? `UPDATE competition_seasons SET current_bootstrapped_at = now(), current_bootstrap_attempted_at = now(), updated_at = now()
+            WHERE competition_id = $1 AND season_id = $2 AND import_scope = 'in_scope'`
+        : `UPDATE competition_seasons SET current_bootstrap_attempted_at = now(), updated_at = now()
+            WHERE competition_id = $1 AND season_id = $2 AND import_scope = 'in_scope'`)
       : `UPDATE competition_seasons SET historical_imported_at = now(), updated_at = now()
           WHERE competition_id = $1 AND season_id = $2 AND import_scope = 'in_scope'`,
     [competitionId, seasonId],
@@ -217,8 +227,8 @@ export async function syncLiveFixtures(): Promise<{ live: number; updated: numbe
        JOIN seasons se ON se.id = cs.season_id
       WHERE cs.import_scope = 'in_scope'
         AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
-        AND se.year = $1`,
-    [config.currentImportSeason],
+        AND se.import_scope = 'in_scope' AND se.year = ANY($1::int[])`,
+    [config.importSeasons],
   );
   const inScope = new Set(pairs.map((r) => `${r.provider_id}:${r.year}`));
   if (inScope.size === 0) return { live: 0, updated: 0, finalized: 0 };
@@ -310,7 +320,9 @@ export async function runPostMatchPipeline(fixtureId: number, quotaClass?: 'esse
  * Upcoming-fixtures sync: ONE request per day (`/fixtures?date=…` returns every
  * league's fixtures for that date) instead of one request per league — a full
  * 7-day window costs 7 requests regardless of how many leagues are in scope.
- * Results are filtered to approved competition/current-season pairs;
+ * Results are filtered to approved competitions × rolling-window seasons
+ * (a date request costs the same; an August–May season keeps syncing after
+ * the January rollover until its last match);
  * upserts are idempotent and raw payloads are stored as usual. `daysBack`
  * is reserved for the daily recently-finished reconciliation and is zero for
  * the normal upcoming task so the provider request count stays predictable.
@@ -324,8 +336,8 @@ export async function syncUpcomingFixtures(daysAhead = 7, daysBack = 0): Promise
        JOIN seasons se ON se.id = cs.season_id
       WHERE cs.import_scope = 'in_scope'
         AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
-        AND se.year = $1`,
-    [config.currentImportSeason],
+        AND se.import_scope = 'in_scope' AND se.year = ANY($1::int[])`,
+    [config.importSeasons],
   );
   const inScope = new Set(pairs.map((r) => `${r.provider_id}:${r.year}`));
   if (inScope.size === 0) return { fixtures: 0, requests: 0 };
@@ -340,7 +352,7 @@ export async function syncUpcomingFixtures(daysAhead = 7, daysBack = 0): Promise
     requests += 1;
     for (const f of res.data.response) {
       const key = `${f.league?.id ?? ''}:${f.league?.season ?? ''}`;
-      if (!inScope.has(key)) continue; // approved competitions, season 2026 only
+      if (!inScope.has(key)) continue; // approved competitions, rolling-window seasons only
       const resolved = await resolveFixtureIds(f);
       const up = await upsertFixture(f, resolved);
       if (up) count += 1;
@@ -357,10 +369,10 @@ export async function enqueuePostMatchTasks(limit = 50, sinceDays = 0): Promise<
       JOIN seasons se ON se.id = f.season_id
       WHERE f.finalized = FALSE AND f.status_short IN ('FT', 'AET', 'PEN')
         AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
-        AND se.year = $2
+        AND se.year = ANY($2::int[]) AND se.import_scope = 'in_scope'
         AND ($3 = 0 OR f.kickoff_utc >= now() - ($3 || ' days')::interval)
       ORDER BY f.kickoff_utc DESC NULLS LAST LIMIT $1`,
-    [limit, config.currentImportSeason, Math.min(Math.max(0, sinceDays), 30)],
+    [limit, config.importSeasons, Math.min(Math.max(0, sinceDays), 30)],
   );
   for (const r of rows) {
     await enqueueTask({

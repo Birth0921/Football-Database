@@ -10,6 +10,8 @@
  *   2 = established second divisions and major regional competitions
  *   3 = approved third divisions and women's domestic competitions
  */
+import { config } from '../config.js';
+
 export type ImportTier = 1 | 2 | 3;
 
 const TIER_1_IDS = [
@@ -124,16 +126,17 @@ export function approvedProviderIds(allowSynthetic = false): string[] {
   return ids.map(String);
 }
 
-export function historicalImportSeasons(seasons: readonly number[]): number[] {
-  return seasons.filter((year) => year !== 2026);
+/** Window seasons other than the current one (one-time historical imports). */
+export function historicalImportSeasons(seasons: readonly number[], current: number = config.currentImportSeason): number[] {
+  return seasons.filter((year) => year !== current);
 }
 
 export function isImportSeason(year: unknown, seasons: readonly number[]): year is number {
   return Number.isInteger(year) && seasons.includes(Number(year));
 }
 
-export function isCurrentImportSeason(year: unknown): boolean {
-  return Number(year) === 2026;
+export function isCurrentImportSeason(year: unknown, current: number = config.currentImportSeason): boolean {
+  return Number(year) === current;
 }
 
 // ---------------------------------------------------------------------------

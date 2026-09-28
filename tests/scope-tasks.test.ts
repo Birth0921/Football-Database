@@ -15,8 +15,8 @@ import { processTask, registerHandler } from '../src/sync/engine.js';
 import {
   findScopedPair, isPermanentTaskError, isTaskInScope, ScopeSkipError, skipOutOfScopeTasks,
 } from '../src/sync/scope-guard.js';
-import { importTierForCompetition } from '../src/sync/import-scope.js';
-import { config, parseImportSeasons } from '../src/config.js';
+import { historicalImportSeasons, importTierForCompetition } from '../src/sync/import-scope.js';
+import { config, currentSeasonFor, parseImportSeasons, rollingSeasonWindow } from '../src/config.js';
 
 const P = `scope-test-${Date.now()}`;
 let comp39 = 0;
@@ -83,13 +83,25 @@ afterAll(async () => {
 });
 
 describe('season allowlist', () => {
-  it('accepts exactly 2023,2024,2025,2026 and rejects everything else', () => {
-    expect(config.importSeasons).toEqual([2023, 2024, 2025, 2026]);
-    expect(parseImportSeasons('2023,2024,2025,2026')).toEqual([2023, 2024, 2025, 2026]);
-    expect(parseImportSeasons('2026, 2025, 2024, 2023')).toEqual([2023, 2024, 2025, 2026]);
-    for (const bad of ['2022,2023,2024,2025', '2023,2024,2025,2026,2027', '2023,2024,2025', '2023,2024,2025,2025', 'all', '']) {
-      expect(() => parseImportSeasons(bad), bad).toThrow(/IMPORT_SEASONS must be exactly/);
+  it('rolling 4-season window: 2026 → 2023–2026, 2027 → 2024–2027, 2028 → 2025–2028', () => {
+    expect(rollingSeasonWindow(2026)).toEqual([2023, 2024, 2025, 2026]);
+    expect(rollingSeasonWindow(2027)).toEqual([2024, 2025, 2026, 2027]);
+    expect(rollingSeasonWindow(2028)).toEqual([2025, 2026, 2027, 2028]);
+    expect(currentSeasonFor(new Date('2026-12-31T23:59:59Z'))).toBe(2026);
+    expect(currentSeasonFor(new Date('2027-01-01T00:00:00Z'))).toBe(2027);
+    expect(config.importSeasons).toEqual(rollingSeasonWindow(currentSeasonFor()));
+    expect(config.importSeasons).toHaveLength(4);
+  });
+
+  it('IMPORT_SEASONS can never widen or pin the window (stale values are ignored, not fatal)', () => {
+    const in2027 = new Date('2027-03-01T00:00:00Z');
+    expect(parseImportSeasons(undefined, in2027)).toEqual([2024, 2025, 2026, 2027]);
+    expect(parseImportSeasons('rolling', in2027)).toEqual([2024, 2025, 2026, 2027]);
+    expect(parseImportSeasons('2027,2026,2025,2024', in2027)).toEqual([2024, 2025, 2026, 2027]);
+    for (const bad of ['2023,2024,2025,2026', '2022,2023,2024,2025,2026,2027', '2027', 'all', '1990,2030']) {
+      expect(parseImportSeasons(bad, in2027), bad).toEqual([2024, 2025, 2026, 2027]);
     }
+    expect(historicalImportSeasons([2024, 2025, 2026, 2027], 2027)).toEqual([2024, 2025, 2026]);
   });
 
   it('pairs with a season outside 2023–2026 are never in scope, even if mis-flagged', async () => {
@@ -247,7 +259,7 @@ describe('missing competition/season is permanent, never retryable', () => {
 
 describe('scheduler scope filtering + stable historical imports', () => {
   it('season-window enqueue only queues in-scope pairs that were never imported', async () => {
-    await query(`DELETE FROM sync_tasks WHERE task_key LIKE 'fixtures:import:%'`);
+    await query(`DELETE FROM sync_tasks WHERE task_type = 'fixtures:import'`);
     const res = await enqueueSeasonWindowTasks();
     const rows = await query<{ competition_id: string; year: number; priority: number; historical_imported_at: string | null; current_bootstrapped_at: string | null; active: boolean; import_tier: number | null }>(
       `SELECT (t.params->>'competitionId') AS competition_id, se.year, t.priority, c.active, c.import_tier,
@@ -256,7 +268,7 @@ describe('scheduler scope filtering + stable historical imports', () => {
          JOIN competitions c ON c.id = (t.params->>'competitionId')::bigint
          JOIN seasons se ON se.id = (t.params->>'seasonId')::bigint
          JOIN competition_seasons cs ON cs.competition_id = c.id AND cs.season_id = se.id
-        WHERE t.task_key LIKE 'fixtures:import:%'`,
+        WHERE t.task_type = 'fixtures:import'`,
     );
     expect(rows.length).toBe(res.tasks);
     for (const r of rows) {

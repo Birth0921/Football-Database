@@ -135,7 +135,7 @@ internal URL.
 | `PROVIDER_ESSENTIAL_RESERVE` | no | 0 = auto (~7% of quota, cap 10 000) — kept for live/upcoming sync |
 | `PROVIDER_BACKGROUND_FLOOR_PERCENT` | no | 20 — background imports pause at/below this % remaining |
 | `PROVIDER_MINUTE_LIMIT` | no | 300 |
-| `IMPORT_SEASONS` | no | exactly `2023,2024,2025,2026`; other values are rejected |
+| `IMPORT_SEASONS` | no | unset or `rolling` (rolling 4-season window; other values are ignored and can never widen it) |
 | `HISTORICAL_SEASONS_BACK` | no | legacy compatibility only; fixed importer scope is `IMPORT_SEASONS` |
 | `SYNC_LIVE_INTERVAL_SECONDS` | no | 60 |
 | `SYNC_UPCOMING_INTERVAL_SECONDS` | no | 900 |
@@ -224,8 +224,8 @@ metadata cycles, see [SYNC.md](SYNC.md)). For cron-only environments, schedule:
 ## Controlled clean rebuild of the imported football data
 
 Resets ONLY imported football data + import/queue state, then rebuilds from the
-approved Tier 1–3 catalogue (men + women, club + national) for seasons
-2023–2026. Never drops the database/schema; never touches API clients/keys,
+approved Tier 1–3 catalogue (men + women, club + national) for the rolling
+4-season window (2023–2026 while the current season is 2026). Never drops the database/schema; never touches API clients/keys,
 the managed website key, API usage/audit logs, `schema_migrations`, the
 provider quota ledger (`provider_quota`, `provider_requests`), `.env`, Docker
 or Redis configuration. Nothing here runs automatically.
@@ -252,8 +252,8 @@ back if any protected table's row count changes. Identity sequences are not
 restarted. Running it again deletes 0 rows.
 
 `import:clean-rebuild` is idempotent: it imports the approved catalogue (one
-provider request), marks stale out-of-scope queue rows `skipped`, runs the 2026
-current sync (live + today/upcoming + post-match) immediately, and queues the
-one-time imports as quota-gated background work: 2026 season bootstrap
-(priority 35) and 2023–2025 history (priority 55). Pairs already imported are
+provider request), marks stale out-of-scope queue rows `skipped`, runs the
+current-season sync (live + today/upcoming + post-match) immediately, and queues the
+one-time imports as quota-gated background work: current-season bootstrap
+(priority 35) and the other window seasons as history (priority 55). Pairs already imported are
 never queued again.
