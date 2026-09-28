@@ -5,6 +5,7 @@
  */
 import { query, queryOne } from '../lib/db.js';
 import type { SyncTaskRow } from '../types.js';
+import { isScopedTaskType, isTaskInScope, SCOPE_SKIP_PREFIX } from './scope-guard.js';
 
 export interface EnqueueTaskInput {
   taskKey: string;
@@ -27,7 +28,22 @@ export async function upsertJob(jobKey: string, kind: string, params: Record<str
   return row!.id;
 }
 
+/**
+ * Idempotent enqueue (one row per task_key). Competition/season- and
+ * fixture-scoped tasks are only accepted when their target is inside the
+ * approved import scope; otherwise nothing is queued, any queued row with the
+ * same key is marked `skipped`, and 0 is returned.
+ */
 export async function enqueueTask(input: EnqueueTaskInput): Promise<number> {
+  if (isScopedTaskType(input.taskType) && !(await isTaskInScope(input.taskType, input.params ?? {}))) {
+    await query(
+      `UPDATE sync_tasks
+          SET status = 'skipped', completed_at = now(), last_error = $2, updated_at = now()
+        WHERE task_key = $1 AND status IN ('pending', 'failed')`,
+      [input.taskKey, `${SCOPE_SKIP_PREFIX} (rejected at enqueue)`],
+    );
+    return 0;
+  }
   const row = await queryOne<{ id: number }>(
     `INSERT INTO sync_tasks (job_id, task_key, task_type, params, priority, scheduled_for, max_attempts, status)
      VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
@@ -57,7 +73,7 @@ export async function enqueueTask(input: EnqueueTaskInput): Promise<number> {
       input.maxAttempts ?? 5,
     ],
   );
-  return row!.id;
+  return Number(row!.id);
 }
 
 export async function enqueueTasks(inputs: EnqueueTaskInput[]): Promise<number> {
@@ -86,7 +102,12 @@ export async function claimDueTasks(limit: number, opts: { includeDeferred?: boo
     [limit],
   );
   void opts;
-  return rows;
+  // UPDATE … RETURNING does not preserve the CTE's ORDER BY: restore strict
+  // priority order so live/current work in a batch always runs first.
+  return rows.sort((a, b) =>
+    Number(a.priority) - Number(b.priority)
+    || new Date(a.scheduled_for).getTime() - new Date(b.scheduled_for).getTime()
+    || Number(a.id) - Number(b.id));
 }
 
 export async function claimTaskById(id: number): Promise<SyncTaskRow | null> {
@@ -123,6 +144,21 @@ export async function markTaskFailed(id: number, error: Error, durationMs: numbe
     [id, String(error.message).slice(0, 1000), JSON.stringify({ name: error.name, stack: String(error.stack ?? '').slice(0, 2000) }), durationMs],
   );
   return rows[0]!;
+}
+
+/** Permanently skip a task (missing/out-of-scope target): never retried. */
+export async function markTaskSkipped(id: number, reason: string, durationMs: number): Promise<SyncTaskRow | null> {
+  const rows = await query<SyncTaskRow>(
+    `UPDATE sync_tasks
+        SET status = 'skipped', completed_at = now(), duration_ms = $3,
+            last_error = $2,
+            result_summary = jsonb_build_object('skipped', true, 'reason', $2::text),
+            updated_at = now()
+      WHERE id = $1
+      RETURNING *`,
+    [id, reason.slice(0, 1000), durationMs],
+  );
+  return rows[0] ?? null;
 }
 
 export async function retryFailedTasks(taskKeys?: string[]): Promise<number> {

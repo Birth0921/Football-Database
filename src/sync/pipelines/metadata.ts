@@ -9,11 +9,13 @@ import {
 } from '../../provider/mapper.js';
 import type { AfLeague, AfTeam, AfSquadEntry, AfPlayerInfo } from '../../provider/types.js';
 import { enqueueTask, upsertJob } from '../tasks.js';
+import { resolveScopedPair, skipOutOfScopeTasks } from '../scope-guard.js';
 import { config } from '../../config.js';
 import { logger } from '../../lib/logger.js';
 import { cacheGet, cacheSet, cacheKeys, cacheDel, cacheDelPattern } from '../../lib/cache.js';
 import {
   approvedProviderIds,
+  filterApprovedLeagues,
   historicalImportSeasons,
   importTierForCompetition,
   isImportSeason,
@@ -45,7 +47,7 @@ function chunk<T>(items: T[], size: number): T[][] {
  * shared teams, players, referees or venues. Foreign-keyed fixture/stat rows
  * remain valid and are simply hidden from the active import scope.
  */
-export async function cleanupImportScope(approvedIds?: string[]): Promise<{ disabledCompetitions: number; outOfScopeCompetitionSeasons: number; outOfScopeSeasons: number }> {
+export async function cleanupImportScope(approvedIds?: string[]): Promise<{ disabledCompetitions: number; outOfScopeCompetitionSeasons: number; outOfScopeSeasons: number; skippedTasks: number }> {
   const allowedIds = approvedIds ?? approvedProviderIds(config.providerMode === 'mock');
   const years = config.importSeasons;
   const result = await withTransaction(async (client) => {
@@ -90,7 +92,10 @@ export async function cleanupImportScope(approvedIds?: string[]): Promise<{ disa
   });
   await cacheDel(cacheKeys.competitions());
   await cacheDelPattern('fdp:fixtures:*', 'fdp:standings:*', 'fdp:competitions:*', 'fdp:teams:*');
-  return result;
+  // Queued work for pairs/fixtures that just left the scope must stop now.
+  const tasks = await skipOutOfScopeTasks();
+  if (tasks.skipped > 0) logger.info(tasks, 'skipped queued tasks outside the approved import scope');
+  return { ...result, skippedTasks: tasks.skipped };
 }
 
 /**
@@ -112,10 +117,10 @@ export async function importCompetitions(): Promise<{ competitions: number; seas
   const res = await provider.get<LeagueEntry>('/leagues', {});
   const fetchMs = Date.now() - t0;
   const allowSynthetic = config.providerMode === 'mock';
-  const approved = res.data.response.filter((entry) => {
-    const league = (entry.league ?? entry) as AfLeague;
-    return importTierForCompetition({ id: league.id, name: league.name }, allowSynthetic) !== null;
-  });
+  // Tier 1–3 allowlist is the ONLY filter: men + women, club + national.
+  const approvedWithProfile = filterApprovedLeagues(res.data.response, allowSynthetic);
+  const approved = approvedWithProfile.map((a) => a.entry);
+  const profileByPid = new Map(approvedWithProfile.map(({ entry, profile }) => [String(((entry.league ?? entry) as AfLeague).id), profile]));
   const comps = approved.length;
   const seasonYears = new Set<number>(config.importSeasons);
 
@@ -138,11 +143,22 @@ export async function importCompetitions(): Promise<{ competitions: number; seas
 
   const tExtract0 = Date.now();
   const leagueRows: { dto: AfLeague & { type?: string | null }; raw: unknown; countryName: string | null }[] = [];
+  // (provider competition id, season year) pairs the provider actually lists
+  // inside the fixed window; a league without a season list falls back to the
+  // whole window. Avoids empty pairs (e.g. a World Cup in a non-World-Cup year).
+  const pairPids: string[] = [];
+  const pairYears: number[] = [];
   for (const entry of approved) {
     const league = (entry.league ?? entry) as AfLeague;
     const dto = { ...league, type: league.type ?? 'League' };
     const countryName = entry.country?.name ?? s(league.country) ?? null;
     leagueRows.push({ dto, raw: dto, countryName });
+    const listed = (entry.seasons ?? []).map((sy) => Number(sy.year)).filter((y) => isImportSeason(y, config.importSeasons));
+    const years = (entry.seasons ?? []).length > 0 ? [...new Set(listed)] : [...config.importSeasons];
+    for (const y of years) {
+      pairPids.push(String(league.id));
+      pairYears.push(y);
+    }
     if (countryName) {
       const key = countryName.toLowerCase();
       if (!countries.has(key)) {
@@ -222,21 +238,24 @@ export async function importCompetitions(): Promise<{ competitions: number; seas
     country_id: countryName ? (countryIdByName.get(countryName.toLowerCase()) ?? null) : null,
     logo: s(dto.logo),
     flag: s(dto.flag),
-    national: b(dto.is_national),
-    tier: importTierForCompetition({ id: dto.id, name: dto.name }, allowSynthetic),
+    national: profileByPid.get(String(dto.id))?.teamType === 'national',
+    gender: profileByPid.get(String(dto.id))?.gender ?? null,
+    team_type: profileByPid.get(String(dto.id))?.teamType ?? null,
+    tier: profileByPid.get(String(dto.id))?.tier ?? importTierForCompetition({ id: dto.id, name: dto.name }, allowSynthetic),
     pid: String(dto.id),
     raw,
   }));
   const compIdRows = await mapWithConcurrency(chunk(competitionPayloads, 250), 2, async (rows) =>
     query<{ id: number; provider_id: string }>(
-      `INSERT INTO competitions (name, code, type, country_id, logo_url, flag_url, is_national, import_tier, active, provider, provider_id, raw)
-       SELECT r.name, r.code, r.type, r.country_id, r.logo, r.flag, r.national, r.tier, TRUE, 'api-football', r.pid, r.raw
+      `INSERT INTO competitions (name, code, type, country_id, logo_url, flag_url, is_national, gender, team_type, import_tier, active, provider, provider_id, raw)
+       SELECT r.name, r.code, r.type, r.country_id, r.logo, r.flag, r.national, r.gender, r.team_type, r.tier, TRUE, 'api-football', r.pid, r.raw
          FROM jsonb_to_recordset($1::jsonb)
-         AS r(name text, code text, type text, country_id bigint, logo text, flag text, national boolean, tier smallint, pid text, raw jsonb)
+         AS r(name text, code text, type text, country_id bigint, logo text, flag text, national boolean, gender text, team_type text, tier smallint, pid text, raw jsonb)
        ON CONFLICT (provider, provider_id) DO UPDATE SET
          name = EXCLUDED.name, code = EXCLUDED.code, type = EXCLUDED.type,
          country_id = EXCLUDED.country_id, logo_url = EXCLUDED.logo_url, flag_url = EXCLUDED.flag_url,
-         is_national = EXCLUDED.is_national, import_tier = EXCLUDED.import_tier, active = TRUE,
+         is_national = EXCLUDED.is_national, gender = EXCLUDED.gender, team_type = EXCLUDED.team_type,
+         import_tier = EXCLUDED.import_tier, active = TRUE,
          raw = EXCLUDED.raw, updated_at = now()
        RETURNING id, provider_id`,
       [JSON.stringify(rows)],
@@ -250,19 +269,22 @@ export async function importCompetitions(): Promise<{ competitions: number; seas
   // the scheduler decides which task class may touch each year.
   const tPair0 = Date.now();
   let pairedRows = 0;
-  const pairingResults = await mapWithConcurrency(chunk(yearList, 12), 2, async (years) =>
+  const pairingResults = await mapWithConcurrency(
+    chunk(pairPids.map((pid, k) => [pid, pairYears[k]] as const), 2000), 2, async (rows) =>
     query<{ c: number }>(
       `WITH ins AS (
          INSERT INTO competition_seasons (competition_id, season_id, is_current, import_scope)
-         SELECT c.id, s.id, (s.year = $1), 'in_scope'
-           FROM competitions c CROSS JOIN seasons s
+         SELECT c.id, se.id, (se.year = $1), 'in_scope'
+           FROM unnest($2::text[], $3::int[]) AS p(pid, y)
+           JOIN competitions c ON c.provider = 'api-football' AND c.provider_id = p.pid
+           JOIN seasons se ON se.year = p.y
           WHERE c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
-            AND s.import_scope = 'in_scope' AND s.year = ANY($2::int[])
+            AND se.import_scope = 'in_scope' AND se.year = ANY($4::int[])
          ON CONFLICT (competition_id, season_id) DO UPDATE SET
            is_current = EXCLUDED.is_current, import_scope = 'in_scope', updated_at = now()
          RETURNING 1)
        SELECT count(*)::int AS c FROM ins`,
-      [config.currentImportSeason, years],
+      [config.currentImportSeason, rows.map((r) => r[0]), rows.map((r) => r[1]), config.importSeasons],
     ),
   );
   pairedRows = pairingResults.reduce((sum, r) => sum + (r[0]?.c ?? 0), 0);
@@ -305,17 +327,7 @@ export interface CoverageFlags {
  */
 export async function discoverCoverage(competitionId: number, seasonId: number): Promise<CoverageFlags> {
   const provider = await getProvider();
-  const ids = await queryOne<{ provider_id: string; season_year: number }>(
-    `SELECT c.provider_id, se.year AS season_year
-       FROM competition_seasons cs
-       JOIN competitions c ON c.id = cs.competition_id
-       JOIN seasons se ON se.id = cs.season_id
-      WHERE cs.competition_id = $1 AND cs.season_id = $2
-        AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
-        AND cs.import_scope = 'in_scope' AND se.import_scope = 'in_scope'`,
-    [competitionId, seasonId],
-  );
-  if (!ids) throw new Error(`competition/season not found: ${competitionId}/${seasonId}`);
+  const ids = await resolveScopedPair(competitionId, seasonId);
 
   const pLeague = Number(ids.provider_id);
   const pSeason = ids.season_year;
@@ -395,17 +407,7 @@ export async function getCoverage(competitionId: number, seasonId: number): Prom
 /** Import teams + squads + referee list for a competition/season. */
 export async function importTeamsAndSquads(competitionId: number, seasonId: number): Promise<{ teams: number; players: number; referees: number }> {
   const provider = await getProvider();
-  const ids = await queryOne<{ provider_id: string; season_year: number }>(
-    `SELECT c.provider_id, se.year AS season_year
-       FROM competition_seasons cs
-       JOIN competitions c ON c.id = cs.competition_id
-       JOIN seasons se ON se.id = cs.season_id
-      WHERE cs.competition_id = $1 AND cs.season_id = $2
-        AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
-        AND cs.import_scope = 'in_scope' AND se.import_scope = 'in_scope'`,
-    [competitionId, seasonId],
-  );
-  if (!ids) throw new Error(`competition/season not found: ${competitionId}/${seasonId}`);
+  const ids = await resolveScopedPair(competitionId, seasonId);
   const pLeague = Number(ids.provider_id);
   const pSeason = ids.season_year;
 
@@ -531,34 +533,51 @@ export async function importSeasonsCli(): Promise<{ seasons: number }> {
   return { seasons: years.size };
 }
 
-/** Enqueue fixture imports for every in-scope competition/season (current
- *  seasons first). Coverage/teams/standings follow-ups are chained by the
- *  fixtures:import handler only for pairs that actually have fixtures. */
-export async function enqueueSeasonWindowTasks(): Promise<{ tasks: number }> {
+/**
+ * Enqueue the ONE-TIME fixture import for every in-scope pair that has not
+ * been imported yet:
+ *   - 2026 (current) pairs without `current_bootstrapped_at` → priority 35
+ *     (after live 10 / upcoming 20 / recent 22 / post-match 25)
+ *   - 2023–2025 pairs without `historical_imported_at`       → priority 55
+ * Both are quota class "background", so they are deferred with backoff when
+ * quota is constrained while live/current sync keeps running. Already
+ * imported pairs are never re-queued. Coverage/teams/standings follow-ups are
+ * chained by fixtures:import only for pairs that actually have fixtures.
+ */
+export async function enqueueSeasonWindowTasks(): Promise<{ tasks: number; current: number; historical: number }> {
   const historicalSeasons = historicalImportSeasons(config.importSeasons);
-  const rows = await query<{ competition_id: number; season_id: number }>(
-    `SELECT cs.competition_id, cs.season_id
+  const rows = await query<{ competition_id: number; season_id: number; year: number }>(
+    `SELECT cs.competition_id, cs.season_id, se.year
        FROM competition_seasons cs
        JOIN competitions c ON c.id = cs.competition_id
        JOIN seasons se ON se.id = cs.season_id
-      WHERE cs.import_scope = 'in_scope'
+      WHERE cs.import_scope = 'in_scope' AND se.import_scope = 'in_scope'
         AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
-        AND se.year = ANY($1::int[])
-        AND cs.historical_imported_at IS NULL
-      ORDER BY se.year DESC`,
-    [historicalSeasons],
+        AND (
+          (se.year = ANY($1::int[]) AND cs.historical_imported_at IS NULL)
+          OR (se.year = $2 AND cs.current_bootstrapped_at IS NULL)
+        )
+      ORDER BY se.year DESC, c.import_tier ASC, cs.competition_id ASC`,
+    [historicalSeasons, config.currentImportSeason],
   );
   const jobId = await upsertJob(`season-window:${new Date().toISOString().slice(0, 10)}`, 'metadata', { count: rows.length }, 20);
+  let current = 0;
+  let historical = 0;
   for (const r of rows) {
-    await enqueueTask({
+    const isCurrent = r.year === config.currentImportSeason;
+    const id = await enqueueTask({
       taskKey: `fixtures:import:${r.competition_id}:${r.season_id}`,
       taskType: 'fixtures:import',
-      params: { competitionId: r.competition_id, seasonId: r.season_id },
-      priority: 55,
+      params: { competitionId: Number(r.competition_id), seasonId: Number(r.season_id) },
+      priority: isCurrent ? 35 : 55,
       jobId,
     });
+    if (id) {
+      if (isCurrent) current += 1;
+      else historical += 1;
+    }
   }
-  return { tasks: rows.length };
+  return { tasks: current + historical, current, historical };
 }
 
 void b;

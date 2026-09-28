@@ -13,14 +13,29 @@ import { logger } from '../lib/logger.js';
 import { config, ensureSecretsForProduction } from '../config.js';
 import { queryOne } from '../lib/db.js';
 import { reconcileQuota } from '../sync/quota-reconcile.js';
+import { skipOutOfScopeTasks } from '../sync/scope-guard.js';
 
 let lastQuotaReconcile = 0;
 let bootstrapTaskKey: string | null = null;
+let lastScopeSweep = 0;
+
+/**
+ * Stop stale queued work (e.g. `teams:import` for a competition/season that no
+ * longer exists or left the approved scope). Runs at startup and every five
+ * minutes; cheap single UPDATE, no provider requests.
+ */
+async function sweepOutOfScopeTasks(now: number): Promise<void> {
+  if (now - lastScopeSweep < 5 * 60_000) return;
+  lastScopeSweep = now;
+  const res = await skipOutOfScopeTasks();
+  if (res.skipped > 0) logger.info(res, 'skipped stale tasks outside the approved import scope');
+}
 
 async function scheduleCycle(): Promise<void> {
   const now = Date.now();
   const windowKey = `cycle:${Math.floor(now / 60_000)}`;
   await upsertJob(windowKey, 'scheduler', {}, 10);
+  await sweepOutOfScopeTasks(now).catch((err) => logger.warn({ err: (err as Error).message }, 'scope sweep failed'));
 
   // A clean production database has no in-scope pairs after migrations. Queue
   // one current refresh so the handler can initialise metadata and populate

@@ -13,7 +13,8 @@ function bullConnection() {
   return { url: config.redisUrl, maxRetriesPerRequest: null as null };
 }
 import type { SyncTaskRow } from '../types.js';
-import { claimDueTasks, claimTaskById, deferTaskForQuota, markTaskDone, markTaskFailed, requeueStuckTasks } from './tasks.js';
+import { claimDueTasks, claimTaskById, deferTaskForQuota, markTaskDone, markTaskFailed, markTaskSkipped, requeueStuckTasks } from './tasks.js';
+import { isPermanentTaskError, isScopedTaskType, isTaskInScope, SCOPE_SKIP_PREFIX } from './scope-guard.js';
 import { quotaManager } from './quota.js';
 
 export type TaskHandler = (params: Record<string, unknown>, task: SyncTaskRow) => Promise<unknown>;
@@ -50,6 +51,14 @@ export async function processTask(task: SyncTaskRow): Promise<boolean> {
     // quota is low; background work is deferred with exponential backoff and
     // never burns failure attempts. A task may explicitly downgrade a shared
     // handler, e.g. historical fixture details.
+    // Scope gate BEFORE the quota gate: a task whose competition/season or
+    // fixture no longer exists (or left the approved scope) is skipped
+    // permanently — it must not be deferred, retried or reach the provider.
+    if (isScopedTaskType(task.task_type) && !(await isTaskInScope(task.task_type, task.params ?? {}))) {
+      await markTaskSkipped(task.id, `${SCOPE_SKIP_PREFIX}: ${task.task_key}`, Date.now() - t0);
+      log.warn('task skipped permanently: target missing or outside approved import scope');
+      return true;
+    }
     const gate = await quotaManager.allows(taskClass);
     if (!gate.allowed) {
       const delay = quotaManager.deferDelaySeconds(Number(task.quota_defers ?? 0));
@@ -63,6 +72,11 @@ export async function processTask(task: SyncTaskRow): Promise<boolean> {
     return true;
   } catch (err) {
     const e = err as Error;
+    if (isPermanentTaskError(e)) {
+      await markTaskSkipped(task.id, `skipped (permanent): ${e.message}`, Date.now() - t0);
+      log.warn({ err: e.message }, 'task skipped permanently (not retryable)');
+      return true;
+    }
     const failed = await markTaskFailed(task.id, e, Date.now() - t0);
     log.error({ err: e.message, status: failed.status, attempts: failed.attempts }, 'task failed');
     return false;

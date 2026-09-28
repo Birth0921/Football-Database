@@ -62,6 +62,9 @@ export async function runCli(fn: (args: CliArgs) => Promise<unknown>): Promise<v
 export async function runTaskOnce(taskType: string, params: Record<string, unknown> = {}, taskKey = `cli:${taskType}:${Date.now()}`): Promise<unknown> {
   await upsertJob(taskKey, 'cli', params, 5);
   const taskId = await enqueueTask({ taskKey, taskType, params, priority: 1, maxAttempts: 3 });
+  if (!taskId) {
+    throw new Error(`task ${taskType} rejected: competition/season or fixture is missing or outside the approved import scope`);
+  }
   const { processTask } = await import('../sync/engine.js');
   const { getTaskByKey, claimTaskById } = await import('../sync/tasks.js');
   const claimed = await claimTaskById(taskId);

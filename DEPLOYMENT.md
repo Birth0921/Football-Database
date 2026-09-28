@@ -220,3 +220,40 @@ metadata cycles, see [SYNC.md](SYNC.md)). For cron-only environments, schedule:
 1. `npm run api-key:rotate -- --key <prefix> --grace-hours 24`
 2. update the consuming app's `FOOTBALL_API_KEY`
 3. old key auto-expires after the grace window (or revoke immediately)
+
+## Controlled clean rebuild of the imported football data
+
+Resets ONLY imported football data + import/queue state, then rebuilds from the
+approved Tier 1–3 catalogue (men + women, club + national) for seasons
+2023–2026. Never drops the database/schema; never touches API clients/keys,
+the managed website key, API usage/audit logs, `schema_migrations`, the
+provider quota ledger (`provider_quota`, `provider_requests`), `.env`, Docker
+or Redis configuration. Nothing here runs automatically.
+
+```bash
+cd /opt/football-platform
+# 1. stop writers (API + website keep serving)
+docker compose stop scheduler worker
+# 2. dry run: shows what would be deleted and the protected row counts
+docker compose exec api npm run db:reset-imported-data
+# 3. execute (production needs BOTH flags)
+docker compose exec api npm run db:reset-imported-data -- --confirm reset-imported-football-data --production
+# 4. restart writers, then start the clean approved import
+docker compose start worker scheduler
+docker compose exec api npm run import:clean-rebuild
+# 5. verify at any time (read-only, no provider requests)
+docker compose exec api npm run import:scope-report
+```
+
+Rules enforced by the reset: every table must be classified (unknown tables
+abort), the delete order is validated against the live foreign keys, all
+deletes run in one transaction with EXCLUSIVE locks, and the transaction rolls
+back if any protected table's row count changes. Identity sequences are not
+restarted. Running it again deletes 0 rows.
+
+`import:clean-rebuild` is idempotent: it imports the approved catalogue (one
+provider request), marks stale out-of-scope queue rows `skipped`, runs the 2026
+current sync (live + today/upcoming + post-match) immediately, and queues the
+one-time imports as quota-gated background work: 2026 season bootstrap
+(priority 35) and 2023–2025 history (priority 55). Pairs already imported are
+never queued again.

@@ -41,10 +41,12 @@ export function registerAllHandlers(): void {
   registerHandler('fixtures:import', async (p, task) => {
     const competitionId = Number(p.competitionId);
     const seasonId = Number(p.seasonId);
-    const res = await importFixturesForCompetitionSeason(competitionId, seasonId, { fetchDetails: p.fetchDetails !== false });
+    const res = await importFixturesForCompetitionSeason(competitionId, seasonId, { fetchDetails: p.fetchDetails !== false, force: p.force === true });
     // Chain per-pair follow-up work ONLY when the pair actually HAS fixtures —
     // empty pairs never burn provider requests on coverage probes/teams/squads.
-    if (res.imported > 0) {
+    // An already-imported pair is stable: never re-chain its follow-ups.
+    const chain = res.imported > 0 && !res.alreadyImported;
+    if (chain) {
       const followUps = [
         { taskKey: `coverage:${competitionId}:${seasonId}`, taskType: 'coverage:discover', priority: 40 },
         { taskKey: `teams:${competitionId}:${seasonId}`, taskType: 'teams:import', priority: 45 },
@@ -56,7 +58,7 @@ export function registerAllHandlers(): void {
         await enqueueTask({ ...f, params: { competitionId, seasonId }, jobId: task.job_id ?? null });
       }
     }
-    return { ...res, chainedFollowUps: res.imported > 0 };
+    return { ...res, chainedFollowUps: chain };
   });
   registerHandler('fixture:details', async (p) => {
     const quotaClass = p.quotaClass === 'essential' || p.quotaClass === 'background' ? p.quotaClass : undefined;

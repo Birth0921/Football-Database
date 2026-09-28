@@ -136,4 +136,71 @@ export function isCurrentImportSeason(year: unknown): boolean {
   return Number(year) === 2026;
 }
 
+// ---------------------------------------------------------------------------
+// Men/women + club/national classification. Both genders and both team types
+// are IN scope; the classification is stored so API/frontend and audits can
+// verify the mix. It never widens the allowlist — only approved competitions
+// are classified at all.
+// ---------------------------------------------------------------------------
+export type CompetitionGender = 'men' | 'women';
+export type CompetitionTeamType = 'club' | 'national';
+
+/** API-Football IDs of approved national-team competitions. */
+const NATIONAL_TEAM_IDS = new Set<number>([
+  1, // FIFA World Cup
+  4, // UEFA European Championship
+  5, // UEFA Nations League
+  6, // Africa Cup of Nations
+  7, // AFC Asian Cup
+  8, // FIFA Women's World Cup
+  9, // Copa America
+  7985, // UEFA Women's Nations League
+]);
+
+/** API-Football IDs of approved women's competitions (names are also checked). */
+const WOMEN_IDS = new Set<number>([8, 525, 7985, 44, 45, 46, 82, 83, 84, 222, 223, 224, 254, 255, 256]);
+
+const NATIONAL_NAMES = new Set<string>([
+  'world cup', 'fifa world cup', 'world cup women', 'fifa womens world cup', 'fifa world cup women', 'womens world cup',
+  'nations league', 'uefa nations league', 'womens nations league', 'uefa womens nations league',
+  'euro championship', 'uefa european championship', 'copa america', 'africa cup of nations', 'asian cup', 'afc asian cup',
+]);
+
+const WOMEN_NAME = /\b(women|womens|woman|feminine|feminino|femenina|femminile|frauen|damallsvenskan|toppserien|kvindeliga|wsl|nwsl|liga f)\b/;
+
+export interface CompetitionProfile {
+  tier: ImportTier;
+  gender: CompetitionGender;
+  teamType: CompetitionTeamType;
+}
+
+/** Tier + gender + team type for an approved competition; null when not approved. */
+export function classifyCompetition(input: { id?: unknown; name?: unknown }, allowSynthetic = false): CompetitionProfile | null {
+  const tier = importTierForCompetition(input, allowSynthetic);
+  if (tier === null) return null;
+  const id = Number(input.id);
+  const name = normalizeName(input.name);
+  const gender: CompetitionGender = WOMEN_IDS.has(id) || WOMEN_NAME.test(name) ? 'women' : 'men';
+  const teamType: CompetitionTeamType = NATIONAL_TEAM_IDS.has(id) || NATIONAL_NAMES.has(name) ? 'national' : 'club';
+  return { tier, gender, teamType };
+}
+
+/**
+ * Filter a provider /leagues catalogue down to approved Tier 1–3 entries.
+ * The ONLY criterion is the approved tier: men + women and club + national
+ * competitions pass alike; everything else in the catalogue is dropped.
+ */
+export function filterApprovedLeagues<T extends { league?: { id?: unknown; name?: unknown }; id?: unknown; name?: unknown }>(
+  entries: readonly T[],
+  allowSynthetic = false,
+): { entry: T; profile: CompetitionProfile }[] {
+  const out: { entry: T; profile: CompetitionProfile }[] = [];
+  for (const entry of entries) {
+    const league = entry.league ?? entry;
+    const profile = classifyCompetition({ id: league.id, name: league.name }, allowSynthetic);
+    if (profile) out.push({ entry, profile });
+  }
+  return out;
+}
+
 export { normalizeName };

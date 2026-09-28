@@ -41,8 +41,8 @@ function bool(name: string, def: boolean): boolean {
 export const IMPORT_SEASONS = [2023, 2024, 2025, 2026] as const;
 export const CURRENT_IMPORT_SEASON = 2026 as const;
 
-function parseImportSeasons(): number[] {
-  const raw = process.env.IMPORT_SEASONS ?? IMPORT_SEASONS.join(',');
+/** Strict allowlist parser: anything other than exactly 2023,2024,2025,2026 is rejected. */
+export function parseImportSeasons(raw: string = process.env.IMPORT_SEASONS ?? IMPORT_SEASONS.join(',')): number[] {
   const values = raw.split(',').map((part) => Number(part.trim()));
   if (values.length !== IMPORT_SEASONS.length || values.some((year) => !Number.isInteger(year))) {
     throw new Error(`IMPORT_SEASONS must be exactly ${IMPORT_SEASONS.join(',')}`);

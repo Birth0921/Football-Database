@@ -18,6 +18,7 @@ import { logger } from '../../lib/logger.js';
 import { invalidateFixture } from '../../lib/cache.js';
 import { config } from '../../config.js';
 import { isCurrentImportSeason } from '../import-scope.js';
+import { resolveScopedPair, ScopeSkipError } from '../scope-guard.js';
 
 async function resolveFixtureIds(f: AfFixture) {
   const competition = f.league?.id != null
@@ -58,32 +59,31 @@ export interface ImportFixturesResult {
   changed: number;
   completed: number;
   enqueuedDetails: number;
+  /**
+   * true when the pair was already imported once (2023–2025 historical or the
+   * one-time 2026 bootstrap) and was served from PostgreSQL with no provider
+   * request. Continuous 2026 updates come from live/upcoming/recent sync.
+   */
+  alreadyImported?: boolean;
 }
 
 /** Import all fixtures for a competition/season (historical + current). */
-export async function importFixturesForCompetitionSeason(competitionId: number, seasonId: number, opts: { fetchDetails?: boolean } = {}): Promise<ImportFixturesResult> {
+export async function importFixturesForCompetitionSeason(competitionId: number, seasonId: number, opts: { fetchDetails?: boolean; force?: boolean } = {}): Promise<ImportFixturesResult> {
   const provider = await getProvider();
-  const ids = await queryOne<{ provider_id: string; season_year: number; historical_imported_at: string | null }>(
-    `SELECT c.provider_id, se.year AS season_year, cs.historical_imported_at
-       FROM competitions c
-       JOIN competition_seasons cs ON cs.competition_id = c.id
-       JOIN seasons se ON se.id = cs.season_id
-      WHERE c.id = $1 AND se.id = $2
-        AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
-        AND cs.import_scope = 'in_scope'`,
-    [competitionId, seasonId],
-  );
-  if (!ids || !config.importSeasons.includes(ids.season_year)) throw new Error(`competition/season outside import scope: ${competitionId}/${seasonId}`);
+  const ids = await resolveScopedPair(competitionId, seasonId);
 
-  // A completed historical window is immutable for the importer. Return the
-  // stored count without issuing another provider request; task keys remain
-  // resumable when the first attempt failed before this marker was written.
-  if (!isCurrentImportSeason(ids.season_year) && ids.historical_imported_at) {
+  // One-time import per pair: a completed historical window (2023–2025) is
+  // immutable and the 2026 season is bootstrapped once, after which only the
+  // live/today/upcoming/recent windows are requested. `force` is reserved for
+  // explicit operator CLI refreshes.
+  const current = isCurrentImportSeason(ids.season_year);
+  const marker = current ? ids.current_bootstrapped_at : ids.historical_imported_at;
+  if (marker && !opts.force) {
     const existing = await queryOne<{ c: number }>(
       `SELECT count(*)::int AS c FROM fixtures WHERE competition_id = $1 AND season_id = $2`,
       [competitionId, seasonId],
     );
-    return { imported: existing?.c ?? 0, changed: 0, completed: 0, enqueuedDetails: 0 };
+    return { imported: existing?.c ?? 0, changed: 0, completed: 0, enqueuedDetails: 0, alreadyImported: true };
   }
 
   const res = await provider.get<AfFixture>('/fixtures', { league: ids.provider_id, season: ids.season_year });
@@ -129,13 +129,14 @@ export async function importFixturesForCompetitionSeason(competitionId: number, 
     }
     await invalidateFixture(up.fixtureId);
   }
-  if (!isCurrentImportSeason(ids.season_year)) {
-    await query(
-      `UPDATE competition_seasons SET historical_imported_at = now(), updated_at = now()
-        WHERE competition_id = $1 AND season_id = $2 AND import_scope = 'in_scope'`,
-      [competitionId, seasonId],
-    );
-  }
+  await query(
+    current
+      ? `UPDATE competition_seasons SET current_bootstrapped_at = now(), updated_at = now()
+          WHERE competition_id = $1 AND season_id = $2 AND import_scope = 'in_scope'`
+      : `UPDATE competition_seasons SET historical_imported_at = now(), updated_at = now()
+          WHERE competition_id = $1 AND season_id = $2 AND import_scope = 'in_scope'`,
+    [competitionId, seasonId],
+  );
   logger.info({ competitionId, seasonId, ...result }, 'fixtures imported');
   return result;
 }
@@ -177,7 +178,7 @@ export async function fetchFixtureDetails(fixtureId: number, quotaClass?: 'essen
         AND se.import_scope = 'in_scope' AND cs.import_scope = 'in_scope'`,
     [fixtureId],
   );
-  if (!fx) throw new Error(`fixture ${fixtureId} not found`);
+  if (!fx) throw new ScopeSkipError(`fixture ${fixtureId} not found or outside import scope`);
   if (fx.finalized) return { events: 0, teamStats: 0, playerStats: 0, lineups: 0 };
 
   const coverage = fx.competition_id && fx.season_id ? await getCoverage(fx.competition_id, fx.season_id) : null;
@@ -272,7 +273,7 @@ export async function runPostMatchPipeline(fixtureId: number, quotaClass?: 'esse
         AND se.import_scope = 'in_scope' AND cs.import_scope = 'in_scope'`,
     [fixtureId],
   );
-  if (!fx) throw new Error(`fixture ${fixtureId} not found`);
+  if (!fx) throw new ScopeSkipError(`fixture ${fixtureId} not found or outside import scope`);
   if (fx.finalized) return { finalized: true, stats: {} };
 
   // Reuse already-imported details; only re-fetch when something is missing

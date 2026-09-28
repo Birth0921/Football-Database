@@ -4,6 +4,7 @@ import { query, queryOne } from '../../lib/db.js';
 import { n, replaceStandings, s, upsertSidelined, upsertTransfer, upsertPlayer, upsertTeam, upsertReferee } from '../../provider/mapper.js';
 import type { AfInjury, AfStandingsEntry, AfTransfer, AfOddsEntry } from '../../provider/types.js';
 import { getCoverage } from './metadata.js';
+import { resolveScopedPair } from '../scope-guard.js';
 import { logger } from '../../lib/logger.js';
 import { cacheDelPattern } from '../../lib/cache.js';
 
@@ -11,24 +12,9 @@ export async function syncStandings(competitionId: number, seasonId: number): Pr
   const coverage = await getCoverage(competitionId, seasonId);
   if (coverage?.standings === false) return { rows: 0 };
   const provider = await getProvider();
-  const ids = await queryOne<{ provider_id: string; season_year: number }>(
-    `SELECT c.provider_id, se.year AS season_year
-       FROM competition_seasons cs
-       JOIN competitions c ON c.id = cs.competition_id
-       JOIN seasons se ON se.id = cs.season_id
-      WHERE cs.competition_id = $1 AND cs.season_id = $2
-        AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
-        AND cs.import_scope = 'in_scope' AND se.import_scope = 'in_scope'`,
-    [competitionId, seasonId],
-  );
-  if (!ids) throw new Error(`competition/season not found: ${competitionId}/${seasonId}`);
+  const ids = await resolveScopedPair(competitionId, seasonId);
   const res = await provider.get<AfStandingsEntry>('/standings', { league: ids.provider_id, season: ids.season_year });
-  const cs = await queryOne<{ id: number }>(
-    `SELECT id FROM competition_seasons WHERE competition_id = $1 AND season_id = $2`,
-    [competitionId, seasonId],
-  );
-  if (!cs) throw new Error(`competition_seasons row missing for ${competitionId}/${seasonId}`);
-  const rows = await replaceStandings(cs.id, res.data.response as AfStandingsEntry[]);
+  const rows = await replaceStandings(ids.competition_season_id, res.data.response as AfStandingsEntry[]);
   await cacheDelPattern('fdp:standings:*');
   return { rows };
 }
@@ -37,17 +23,7 @@ export async function syncInjuries(competitionId: number, seasonId: number): Pro
   const coverage = await getCoverage(competitionId, seasonId);
   if (coverage?.injuries === false) return { records: 0 };
   const provider = await getProvider();
-  const ids = await queryOne<{ provider_id: string; season_year: number }>(
-    `SELECT c.provider_id, se.year AS season_year
-       FROM competition_seasons cs
-       JOIN competitions c ON c.id = cs.competition_id
-       JOIN seasons se ON se.id = cs.season_id
-      WHERE cs.competition_id = $1 AND cs.season_id = $2
-        AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
-        AND cs.import_scope = 'in_scope' AND se.import_scope = 'in_scope'`,
-    [competitionId, seasonId],
-  );
-  if (!ids) throw new Error(`competition/season not found: ${competitionId}/${seasonId}`);
+  const ids = await resolveScopedPair(competitionId, seasonId);
   const res = await provider.get<AfInjury>('/injuries', { league: ids.provider_id, season: ids.season_year });
   let count = 0;
   for (const rec of res.data.response) {
@@ -106,17 +82,7 @@ export async function syncOdds(competitionId: number, seasonId: number): Promise
   const coverage = await getCoverage(competitionId, seasonId);
   if (coverage?.odds === false) return { records: 0 };
   const provider = await getProvider();
-  const ids = await queryOne<{ provider_id: string; season_year: number }>(
-    `SELECT c.provider_id, se.year AS season_year
-       FROM competition_seasons cs
-       JOIN competitions c ON c.id = cs.competition_id
-       JOIN seasons se ON se.id = cs.season_id
-      WHERE cs.competition_id = $1 AND cs.season_id = $2
-        AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
-        AND cs.import_scope = 'in_scope' AND se.import_scope = 'in_scope'`,
-    [competitionId, seasonId],
-  );
-  if (!ids) throw new Error(`competition/season not found: ${competitionId}/${seasonId}`);
+  const ids = await resolveScopedPair(competitionId, seasonId);
   const res = await provider.get<AfOddsEntry>('/odds', { league: ids.provider_id, season: ids.season_year });
   let count = 0;
   for (const entry of res.data.response) {

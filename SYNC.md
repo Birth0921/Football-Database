@@ -131,3 +131,20 @@ counters first).
 | 500/502/503/504 | exponential backoff, retry ≤ max_attempts |
 | timeout/network | backoff + retry |
 | malformed/partial JSON | raw payload stored; mapping is defensive; unknown event types preserved in JSONB |
+
+## Queue scope guard (stale/orphan tasks)
+
+Competition/season tasks (`fixtures:import`, `coverage:discover`,
+`teams:import`, `standings:sync`, `injuries:sync`, `odds:sync`) and fixture
+tasks (`fixture:details`, `fixture:postmatch`) are accepted only when the
+target exists and is in scope: active competition with tier 1–3, season in
+2023–2026, pair `in_scope`.
+
+- `enqueueTask` rejects out-of-scope work (returns 0) and never revives a skipped row.
+- The engine checks scope before the quota gate. Out-of-scope tasks, and errors
+  such as `competition/season not found`, are marked `skipped` permanently
+  instead of being retried.
+- The scheduler sweeps queued out-of-scope rows at startup and every 5 minutes.
+  `cleanupImportScope` and migration `0005` do the same.
+- `claimDueTasks` returns each batch in strict priority order: live 10 → upcoming 20 →
+  recent 22 → post-match 25 → 2026 bootstrap 35 → history 55.

@@ -366,7 +366,11 @@ describe('quota-aware task scheduling (engine)', () => {
 
     try {
       // background task → deferred, rescheduled, attempts preserved
-      const bgId = await enqueueTask({ taskKey: 'test:defer:bg', taskType: 'teams:import', params: { competitionId: 1, seasonId: 1 }, priority: 5 });
+      // a real in-scope pair: out-of-scope pairs are rejected before the quota gate
+      const bgComp = await queryOne<{ id: number }>(`SELECT id FROM competitions WHERE provider_id = '39'`);
+      const bgSeason = await queryOne<{ id: number }>(`SELECT id FROM seasons WHERE year = 2025`);
+      const bgId = await enqueueTask({ taskKey: 'test:defer:bg', taskType: 'teams:import', params: { competitionId: bgComp!.id, seasonId: bgSeason!.id }, priority: 5 });
+      expect(bgId).toBeGreaterThan(0);
       const bgClaimed = await claimTaskById(bgId);
       expect(bgClaimed).toBeTruthy();
       await processTask(bgClaimed!);
@@ -411,7 +415,8 @@ describe('quota-aware task scheduling (engine)', () => {
     const taskId = await enqueueTask({
       taskKey,
       taskType: 'fixtures:import',
-      params: { competitionId: comp!.id, seasonId: season!.id, fetchDetails: false },
+      // force: earlier tests may already have bootstrapped this 2026 pair once
+      params: { competitionId: comp!.id, seasonId: season!.id, fetchDetails: false, force: true },
       priority: 5,
     });
     const claimed = await claimTaskById(taskId);

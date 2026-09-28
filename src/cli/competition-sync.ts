@@ -15,7 +15,7 @@ runCli(async () => {
       ORDER BY se.year DESC`, [competitionId]);
   const results = [] as unknown[];
   for (const s of seasons) {
-    results.push(await runTaskOnce('fixtures:import', { competitionId, seasonId: s.season_id }, `cli:comp:${competitionId}:${s.season_id}:${Date.now()}`));
+    results.push(await runTaskOnce('fixtures:import', { competitionId, seasonId: s.season_id, force: args.force === true }, `cli:comp:${competitionId}:${s.season_id}:${Date.now()}`));
     await runTaskOnce('standings:sync', { competitionId, seasonId: s.season_id }, `cli:standings:${competitionId}:${s.season_id}:${Date.now()}`);
   }
   return { competitionId, seasons: seasons.length, results };
