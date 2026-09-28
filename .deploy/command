@@ -1,0 +1,1 @@
+echo "exec channel OK ($(date -u +%FT%TZ)); host: $(hostname); user: $(whoami)"

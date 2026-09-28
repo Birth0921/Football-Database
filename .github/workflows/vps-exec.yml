@@ -1,0 +1,53 @@
+name: VPS exec
+
+# Remote control channel: runs the bash command contained in .deploy/command
+# on the production VPS (in /opt/football-platform). Used for data bootstrap,
+# monitoring and ops. Triggered by a push that touches .deploy/command.
+# The output report is pushed to .deploy/reports/ (secrets redacted).
+on:
+  push:
+    branches: [arena/01a0d445-football-database]
+    paths: ['.deploy/command']
+
+concurrency:
+  group: vps-exec
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  exec:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      VPS_HOST: 158.178.196.221
+      VPS_USER: ubuntu
+      APP_DIR: /opt/football-platform
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SSH key
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/vps_key
+          chmod 600 ~/.ssh/vps_key
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Run command on the VPS
+        run: |
+          { ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cd $APP_DIR && $(cat .deploy/command)" ; } 2>&1 | tee /tmp/exec.log
+
+      - name: Publish run report to the repo
+        if: always()
+        run: |
+          git config user.name "exec-bot"
+          git config user.email "exec-bot@users.noreply.github.com"
+          mkdir -p .deploy/reports
+          sed -E 's/pf_live_[A-Za-z0-9_-]+/[REDACTED pf_live]/g; s/eyJ[A-Za-z0-9._-]{10,}/[REDACTED jwt]/g' \
+            /tmp/exec.log > ".deploy/reports/exec-$(date -u +%Y%m%dT%H%M%S).log"
+          git add .deploy/reports
+          git commit -m "exec run report (bot)" || echo "nothing to report"
+          git push

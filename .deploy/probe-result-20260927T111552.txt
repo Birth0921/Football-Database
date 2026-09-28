@@ -1,0 +1,13 @@
+probe at 2026-09-27T11:15:52Z from runnervmtr4k5
+--- DNS (drop host):
+--- control: https://example.com
+HTTP 200
+--- drop: $BASE/vps_key
+HTTP 403
+--- drop verbose tail:
+< x-ratelimit-reset: 0
+< via: 1.1 google
+< alt-svc: h3=":443"; ma=2592000,h3-29=":443"; ma=2592000
+< 
+{ [157 bytes data]
+* Connection #0 to host 9876-i7e6kptq15l4r0ewmey6w.e2b.app left intact

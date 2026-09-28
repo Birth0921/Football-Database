@@ -1,0 +1,104 @@
+name: VPS deploy
+
+# Deploys the platform to the production VPS over SSH.
+# Triggered by a push that touches .deploy/GO.
+# Credentials come from encrypted repository secrets (VPS_SSH_KEY,
+# VPS_ENV) — never from repo content. The run report is pushed back to
+# .deploy/reports/ so the deploy can be monitored via git fetch.
+on:
+  push:
+    branches: [arena/01a0d445-football-database]
+    paths: ['.deploy/GO']
+
+concurrency:
+  group: vps-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      VPS_HOST: 158.178.196.221
+      VPS_USER: ubuntu
+      APP_DIR: /opt/football-platform
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check credentials
+        id: creds
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_ENV: ${{ secrets.VPS_ENV }}
+        run: |
+          if [ -z "$VPS_SSH_KEY" ]; then
+            echo "missing=ssh" >> "$GITHUB_OUTPUT"
+            echo "::error::VPS_SSH_KEY secret is not set — add it (repo Settings → Secrets → Actions) or deploy manually from your machine."
+            exit 1
+          fi
+          echo "has_env=$([[ -n "$VPS_ENV" ]] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/vps_key
+          chmod 600 ~/.ssh/vps_key
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Transfer code
+        run: |
+          ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "mkdir -p $APP_DIR"
+          tar -cf - --exclude=.git --exclude=.deploy . | ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "tar -xf - -C $APP_DIR"
+          echo "code transferred"
+
+      - name: Write production .env (server-side only)
+        if: steps.creds.outputs.has_env == 'yes'
+        env:
+          VPS_ENV: ${{ secrets.VPS_ENV }}
+        run: |
+          printf '%s\n' "$VPS_ENV" | ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cat > $APP_DIR/.env && chmod 600 $APP_DIR/.env"
+          echo ".env written on the server (mode 600)"
+      - name: Keep existing server .env
+        if: steps.creds.outputs.has_env != 'yes'
+        run: |
+          echo "VPS_ENV secret not set — keeping the existing server-side .env untouched""
+
+
+      - name: Deploy (docker install, build, start, migrate, health-wait)
+        run: |
+          ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cd $APP_DIR && bash scripts/deploy/vps-deploy.sh" 2>&1 | tee /tmp/deploy.log
+
+      - name: "Verify from the VPS (doctor: Postgres / Redis / API-Football)"
+        run: |
+          ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cd $APP_DIR && bash scripts/deploy/vps-verify.sh" 2>&1 | tee /tmp/verify.log || true
+
+      - name: Verify from the public internet
+        run: |
+          { echo "--- public checks (http://$VPS_HOST/) ---"
+            for p in / /admin/api-keys /api/v1/docs /api/v1/health /api/v1/health/data; do
+              code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 "http://$VPS_HOST$p")
+              echo "GET $p -> $code"
+            done ; } | tee /tmp/public.log
+
+      - name: Publish run report to the repo
+        if: always()
+        run: |
+          git config user.name "deploy-bot"
+          git config user.email "deploy-bot@users.noreply.github.com"
+          mkdir -p .deploy/reports
+          { echo "deploy run: $GITHUB_RUN_URL"
+            echo "finished: $(date -u +%FT%TZ)"
+            echo
+            echo "=== deploy tail ==="
+            tail -n 25 /tmp/deploy.log 2>/dev/null
+            echo
+            echo "=== verify (doctor) ==="
+            cat /tmp/verify.log 2>/dev/null
+            echo
+            echo "=== public checks ==="
+            cat /tmp/public.log 2>/dev/null
+          } | sed -E 's/pf_live_[A-Za-z0-9_-]+/[REDACTED pf_live]/g; s/eyJ[A-Za-z0-9._-]{10,}/[REDACTED jwt]/g' \
+            > ".deploy/reports/deploy-$(date -u +%Y%m%dT%H%M%S).log"
+          git add .deploy/reports
+          git commit -m "deploy run report (bot)" || echo "nothing to report"
+          git push

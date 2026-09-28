@@ -1,0 +1,133 @@
+# Production compose for a single VPS (tested for Oracle Cloud Ubuntu).
+#
+# Managed services (Neon Postgres, Upstash Redis) are configured through the
+# server-side .env file — never committed. Self-hosted postgres/redis are
+# available as a fallback with:  docker compose --profile local up -d
+#
+# Topology:
+#   web        public entrypoint (website + admin + /api/v1 proxy)  -> ${WEB_PORT:-8080}
+#   api        REST API, loopback-only on the host                  -> 127.0.0.1:4000
+#   worker     sync task executor (BullMQ + task sweep)
+#   scheduler  periodic sync scheduling
+#   migrate    one-shot migrations (profile: tools)
+#
+# Public API access goes through the web proxy, which passes client API keys
+# through, so only one port is exposed.
+
+x-app: &app
+  build: .
+  image: football-platform
+  env_file: .env
+  restart: unless-stopped
+  stop_grace_period: 30s
+  networks:
+    - backend
+
+services:
+  api:
+    <<: *app
+    environment:
+      ROLE: api
+      API_PORT: "4000"
+    ports:
+      - "127.0.0.1:4000:4000" # loopback only — external traffic uses the web proxy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4000/api/v1/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  worker:
+    <<: *app
+    environment:
+      ROLE: worker
+    depends_on:
+      api:
+        condition: service_healthy # migrations are applied on api boot
+
+  scheduler:
+    <<: *app
+    environment:
+      ROLE: scheduler
+    depends_on:
+      api:
+        condition: service_healthy
+
+  web:
+    <<: *app
+    environment:
+      ROLE: web
+      API_INTERNAL_URL: http://api:4000
+    ports:
+      - "${WEB_PORT:-8080}:${WEB_PORT:-8080}"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:'+(process.env.WEB_PORT||8080)+'/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # one-shot migrations:  docker compose --profile tools run --rm migrate
+  migrate:
+    <<: *app
+    environment:
+      ROLE: migrate
+    restart: "no"
+    profiles:
+      - tools
+
+  # self-hosted fallbacks (only with --profile local; point .env at
+  # postgres:5432 / redis://redis:6379 when using them)
+  postgres:
+    image: postgres:16-alpine
+    profiles:
+      - local
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: football
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d football"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    networks:
+      - backend
+
+  redis:
+    image: redis:7-alpine
+    profiles:
+      - local
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    networks:
+      - backend
+
+networks:
+  backend:
+
+volumes:
+  pgdata:
