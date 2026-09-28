@@ -710,14 +710,17 @@ export class MockFootballProvider implements FootballProvider {
       }
 
       case '/fixtures': {
-        if (params.live === 'true' || params.live === '1') {
+        if (params.live === 'true' || params.live === '1' || params.live === 'all') {
           return w.fixtures.filter((f) => ['1H', 'HT', '2H', 'ET', 'P'].includes(f.statusShort)).map((f) => fixtureDto(f, w));
         }
         if (fixtureId) {
           const f = w.fixtureById.get(fixtureId);
           return f ? [fixtureDto(f, w)] : [];
         }
-        let list = w.fixtures.filter((f) => f.compId === leagueId && f.season === season);
+        let list = w.fixtures;
+        if (leagueId) list = list.filter((f) => f.compId === leagueId);
+        if (season) list = list.filter((f) => f.season === season);
+        if (params.date) list = list.filter((f) => f.date.slice(0, 10) === String(params.date));
         if (params.team) list = list.filter((f) => f.homeId === teamId || f.awayId === teamId);
         if (params.from) list = list.filter((f) => f.date.slice(0, 10) >= String(params.from));
         if (params.to) list = list.filter((f) => f.date.slice(0, 10) <= String(params.to));

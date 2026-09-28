@@ -1,7 +1,48 @@
+/**
+ * Provider quota policy.
+ *
+ * The provider's own counters (API-Football /status, response headers when
+ * present) are AUTHORITATIVE for remaining quota; local counting fills the
+ * gaps between reconciliations and is corrected whenever the provider reports.
+ *
+ * Policy (PROVIDER_DAILY_QUOTA stays the configured limit):
+ * - NORMAL    — everything may run.
+ * - CAUTION   — remaining is at/below the background floor
+ *              (max(2 × essential reserve, N% of quota)). Background traffic
+ *              (metadata, historical imports, coverage/teams, injuries/odds…)
+ *              is deferred with backoff. ESSENTIAL live/upcoming fixture sync
+ *              keeps running.
+ * - CRITICAL  — remaining is at/below the essential reserve: only essential
+ *              sync continues (it is what the reserve is for).
+ * - EXHAUSTED — remaining is 0: all provider traffic stops.
+ *
+ * Example: 29,355 of 150,000 remaining (19.6%) with default thresholds
+ * (reserve 10,000, floor 30,000) is CAUTION: live + upcoming sync continue,
+ * background imports wait for the daily reset. Quota numbers are never
+ * fabricated and provider rate limits are never bypassed.
+ */
 import { query, queryOne } from '../lib/db.js';
 import { config } from '../config.js';
 
-export type QuotaState = 'NORMAL' | 'CAUTION' | 'CRITICAL';
+export type QuotaState = 'NORMAL' | 'CAUTION' | 'CRITICAL' | 'EXHAUSTED';
+export type TaskClass = 'essential' | 'background';
+
+/** Task types that keep running while quota is low: live + upcoming fixture
+ *  sync, post-match finalization and the current:sync cycle. Everything else
+ *  (coverage, teams/squads, standings, injuries, transfers, odds, historical
+ *  imports, metadata refreshes) is background. */
+const ESSENTIAL_TASK_TYPES = new Set([
+  'live:sync',
+  'upcoming:sync',
+  'current:sync',
+  'postmatch:scan',
+  'fixture:postmatch',
+  'fixture:details',
+]);
+
+export function taskClassFor(taskType: string | null | undefined): TaskClass {
+  return taskType && ESSENTIAL_TASK_TYPES.has(taskType) ? 'essential' : 'background';
+}
 
 export interface QuotaStatus {
   provider: string;
@@ -13,13 +54,19 @@ export interface QuotaStatus {
   minuteUsed: number;
   minuteRemaining: number;
   state: QuotaState;
+  essentialReserve: number;
+  backgroundFloor: number;
   lastUpdatedAt: string | null;
+  reconciledAt: string | null;
 }
 
-function stateFor(remainingPct: number): QuotaState {
-  if (remainingPct < 20) return 'CRITICAL';
-  if (remainingPct <= 50) return 'CAUTION';
-  return 'NORMAL';
+export interface QuotaGate {
+  allowed: boolean;
+  class: TaskClass;
+  state: QuotaState;
+  dailyRemaining: number;
+  essentialReserve: number;
+  backgroundFloor: number;
 }
 
 function utcDay(d = new Date()): string {
@@ -29,7 +76,32 @@ function utcDay(d = new Date()): string {
 export class QuotaManager {
   constructor(private provider = 'api-football') {}
 
+  /** Essential reserve + background floor derived from configuration. */
+  thresholds(limit = config.providerDailyQuota): { essentialReserve: number; backgroundFloor: number } {
+    const safeLimit = Math.max(limit, 1);
+    const essentialReserve =
+      config.providerEssentialReserve > 0
+        ? Math.min(config.providerEssentialReserve, safeLimit - 1)
+        : Math.max(50, Math.min(10_000, Math.round(safeLimit * 0.07)));
+    const backgroundFloor = Math.min(
+      Math.max(essentialReserve * 2, Math.round(safeLimit * (config.providerBackgroundFloorPercent / 100))),
+      Math.max(safeLimit - 1, 0),
+    );
+    return { essentialReserve, backgroundFloor };
+  }
+
+  stateFor(remaining: number, limit = config.providerDailyQuota): QuotaState {
+    const { essentialReserve, backgroundFloor } = this.thresholds(limit);
+    if (remaining <= 0) return 'EXHAUSTED';
+    if (remaining <= essentialReserve) return 'CRITICAL';
+    if (remaining <= backgroundFloor) return 'CAUTION';
+    return 'NORMAL';
+  }
+
   async ensureToday(): Promise<void> {
+    const { essentialReserve, backgroundFloor } = this.thresholds();
+    void essentialReserve;
+    void backgroundFloor;
     await query(
       `INSERT INTO provider_quota (provider, day, daily_limit, daily_used, daily_remaining, minute_limit, minute_used, minute_remaining)
        VALUES ($1, $2, $3, 0, $3, $4, 0, $4)
@@ -72,29 +144,39 @@ export class QuotaManager {
     if (!row) return;
     let dailyRemaining = row.daily_remaining;
     let minuteRemaining = row.minute_remaining;
+    // provider-reported header values (when present) are authoritative
     if (typeof dailyRemainingFromHeader === 'number') dailyRemaining = dailyRemainingFromHeader;
     if (typeof minuteRemainingFromHeader === 'number') minuteRemaining = minuteRemainingFromHeader;
-    const remainingPct = (dailyRemaining / Math.max(row.daily_limit, 1)) * 100;
     await query(
       `UPDATE provider_quota SET daily_remaining = $3, minute_remaining = $4, state = $5, last_updated_at = now()
         WHERE provider = $1 AND day = $2`,
-      [this.provider, utcDay(), dailyRemaining, minuteRemaining, stateFor(remainingPct)],
+      [this.provider, utcDay(), dailyRemaining, minuteRemaining, this.stateFor(dailyRemaining, row.daily_limit)],
     );
   }
 
-  /** Provider-reported counters (e.g. from /status) override local counting. */
-  async observeExternal(dailyUsed: number | null, dailyLimit: number | null): Promise<void> {
+  /**
+   * Provider-reported counters (authoritative, e.g. from /status requests:
+   * requests.current / requests.limit_day). Reconciles the local row even when
+   * the local state is CRITICAL/EXHAUSTED — values are never fabricated, only
+   * taken from the provider's own response.
+   */
+  async observeExternal(dailyUsed: number | null, dailyLimit: number | null): Promise<QuotaStatus> {
     await this.ensureToday();
-    if (dailyUsed === null && dailyLimit === null) return;
-    const limit = dailyLimit ?? config.providerDailyQuota;
-    const used = dailyUsed ?? 0;
+    if (dailyUsed === null && dailyLimit === null) return this.status();
+    const current = await queryOne<{ daily_limit: number }>(
+      `SELECT daily_limit FROM provider_quota WHERE provider = $1 AND day = $2`,
+      [this.provider, utcDay()],
+    );
+    const limit = dailyLimit ?? current?.daily_limit ?? config.providerDailyQuota;
+    const used = Math.max(dailyUsed ?? 0, 0);
     const remaining = Math.max(limit - used, 0);
     await query(
       `UPDATE provider_quota
-          SET daily_limit = $3, daily_used = $4, daily_remaining = $5, state = $6, last_updated_at = now()
+          SET daily_limit = $3, daily_used = $4, daily_remaining = $5, state = $6, reconciled_at = now(), last_updated_at = now()
         WHERE provider = $1 AND day = $2`,
-      [this.provider, utcDay(), limit, used, remaining, stateFor((remaining / Math.max(limit, 1)) * 100)],
+      [this.provider, utcDay(), limit, used, remaining, this.stateFor(remaining, limit)],
     );
+    return this.status();
   }
 
   async status(): Promise<QuotaStatus> {
@@ -110,15 +192,17 @@ export class QuotaManager {
       minute_remaining: number;
       state: QuotaState;
       last_updated_at: Date | null;
+      reconciled_at: Date | null;
     }>(`SELECT * FROM provider_quota WHERE provider = $1 AND day = $2`, [this.provider, utcDay()]);
     if (!row) {
       await this.ensureToday();
       return this.status();
     }
-    const state = stateFor((row.daily_remaining / Math.max(row.daily_limit, 1)) * 100);
+    const state = this.stateFor(row.daily_remaining, row.daily_limit);
     if (state !== row.state) {
       await query(`UPDATE provider_quota SET state = $3 WHERE provider = $1 AND day = $2`, [this.provider, utcDay(), state]);
     }
+    const { essentialReserve, backgroundFloor } = this.thresholds(row.daily_limit);
     return {
       provider: row.provider,
       day: utcDay(new Date(row.day)),
@@ -129,19 +213,42 @@ export class QuotaManager {
       minuteUsed: row.minute_used,
       minuteRemaining: row.minute_remaining,
       state,
+      essentialReserve,
+      backgroundFloor,
       lastUpdatedAt: row.last_updated_at ? new Date(row.last_updated_at).toISOString() : null,
+      reconciledAt: row.reconciled_at ? new Date(row.reconciled_at).toISOString() : null,
     };
   }
 
   /**
-   * Priority gating: CRITICAL keeps live/score/post-match/near-term work,
-   * defers low-priority historical/metadata refreshes.
+   * Class-aware gating for a task type (or explicit class):
+   *   essential  → allowed unless the provider quota is EXHAUSTED
+   *   background → allowed only while state is NORMAL
    */
-  async shouldDefer(priority: number): Promise<boolean> {
+  async allows(taskTypeOrClass: string | TaskClass): Promise<QuotaGate> {
     const s = await this.status();
-    if (s.state === 'CRITICAL') return priority > 50;
-    if (s.state === 'CAUTION') return priority > 80;
-    return false;
+    const cls: TaskClass =
+      taskTypeOrClass === 'essential' || taskTypeOrClass === 'background'
+        ? taskTypeOrClass
+        : taskClassFor(taskTypeOrClass);
+    const allowed = cls === 'essential' ? s.state !== 'EXHAUSTED' && s.dailyRemaining > 0 : s.state === 'NORMAL';
+    return {
+      allowed,
+      class: cls,
+      state: s.state,
+      dailyRemaining: s.dailyRemaining,
+      essentialReserve: s.essentialReserve,
+      backgroundFloor: s.backgroundFloor,
+    };
+  }
+
+  /**
+   * Backoff for quota-deferred tasks: 5 min → 10 → 20 → 40 → 60 (cap), with
+   * jitter. Deferred tasks are rescheduled, never rapidly retried.
+   */
+  deferDelaySeconds(defers: number): number {
+    const base = 300 * 2 ** Math.min(Math.max(defers, 0), 6);
+    return Math.min(base, 3600) + Math.floor(Math.random() * 60);
   }
 
   async hasQuota(): Promise<boolean> {

@@ -135,6 +135,25 @@ export async function retryFailedTasks(taskKeys?: string[]): Promise<number> {
 }
 
 /**
+ * Defer a task because of provider-quota policy: back to pending with a
+ * future scheduled_for (exponential backoff), the claim's attempt increment
+ * is rolled back so quota deferrals NEVER burn failure retries.
+ */
+export async function deferTaskForQuota(id: number, delaySeconds: number, reason: string): Promise<void> {
+  await query(
+    `UPDATE sync_tasks
+        SET status = 'pending',
+            attempts = GREATEST(attempts - 1, 0),
+            quota_defers = coalesce(quota_defers, 0) + 1,
+            scheduled_for = now() + ($2 || ' seconds')::interval,
+            last_error = $3,
+            updated_at = now()
+      WHERE id = $1`,
+    [id, String(Math.max(1, Math.round(delaySeconds))), reason.slice(0, 500)],
+  );
+}
+
+/**
  * Crash recovery: tasks claimed but never finished (process died) go back to
  * pending. A crash must never strand work or force an import restart.
  */

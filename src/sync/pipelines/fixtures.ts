@@ -234,27 +234,38 @@ export async function runPostMatchPipeline(fixtureId: number): Promise<{ finaliz
 }
 
 /** Refresh upcoming fixture lists (near-term priority). */
-export async function syncUpcomingFixtures(daysAhead = 7): Promise<{ fixtures: number }> {
+/**
+ * Upcoming-fixtures sync: ONE request per day (`/fixtures?date=…` returns every
+ * league's fixtures for that date) instead of one request per league — a full
+ * 7-day window costs 7 requests regardless of how many leagues are in scope.
+ * Results are filtered to configured in-scope competition/season pairs;
+ * upserts are idempotent and raw payloads are stored as usual.
+ */
+export async function syncUpcomingFixtures(daysAhead = 7): Promise<{ fixtures: number; requests: number }> {
   const provider = await getProvider();
-  const from = new Date().toISOString().slice(0, 10);
-  const to = new Date(Date.now() + daysAhead * 864e5).toISOString().slice(0, 10);
-  const seasons = await query<{ id: number; year: number; provider_id: string }>(
-    `SELECT se.id, se.year, c.provider_id
+  const pairs = await query<{ provider_id: string; year: number }>(
+    `SELECT DISTINCT c.provider_id, se.year
        FROM competition_seasons cs
-       JOIN seasons se ON se.id = cs.season_id
        JOIN competitions c ON c.id = cs.competition_id
-      WHERE cs.import_scope = 'in_scope' AND se.is_current = TRUE`,
+       JOIN seasons se ON se.id = cs.season_id
+      WHERE cs.import_scope = 'in_scope'`,
   );
+  const inScope = new Set(pairs.map((r) => `${r.provider_id}:${r.year}`));
   let count = 0;
-  for (const row of seasons) {
-    const res = await provider.get<AfFixture>('/fixtures', { league: row.provider_id, season: row.year, from, to });
+  let requests = 0;
+  for (let d = 0; d < Math.max(1, Math.min(daysAhead, 14)); d++) {
+    const date = new Date(Date.now() + d * 864e5).toISOString().slice(0, 10);
+    const res = await provider.get<AfFixture>('/fixtures', { date });
+    requests += 1;
     for (const f of res.data.response) {
+      const key = `${f.league?.id ?? ''}:${f.league?.season ?? ''}`;
+      if (!inScope.has(key)) continue; // stay within the configured import scope
       const resolved = await resolveFixtureIds(f);
       const up = await upsertFixture(f, resolved);
       if (up) count += 1;
     }
   }
-  return { fixtures: count };
+  return { fixtures: count, requests };
 }
 
 /** Finished-but-not-finalized fixtures → post-match tasks. */

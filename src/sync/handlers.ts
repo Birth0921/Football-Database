@@ -12,7 +12,6 @@ import { recalculateAllPlayers, recalculatePlayersForFixture } from '../stats/pl
 import { recalculateAllLeagues, recalculateLeagueSeason, rebuildAllH2H } from '../stats/leagues.js';
 import { rebuildPredictionFeatures, buildPredictionFeature } from '../stats/predictions.js';
 import { enqueueTask } from './tasks.js';
-import { query } from '../lib/db.js';
 import { rebuildCache } from '../lib/cache-rebuild.js';
 
 let registered = false;
@@ -31,8 +30,26 @@ export function registerAllHandlers(): void {
   registerHandler('season-window:enqueue', async () => enqueueSeasonWindowTasks());
 
   // ---- fixtures -----------------------------------------------------------
-  registerHandler('fixtures:import', async (p) =>
-    importFixturesForCompetitionSeason(Number(p.competitionId), Number(p.seasonId), { fetchDetails: p.fetchDetails !== false }));
+  registerHandler('fixtures:import', async (p, task) => {
+    const competitionId = Number(p.competitionId);
+    const seasonId = Number(p.seasonId);
+    const res = await importFixturesForCompetitionSeason(competitionId, seasonId, { fetchDetails: p.fetchDetails !== false });
+    // Chain per-pair follow-up work ONLY when the pair actually HAS fixtures —
+    // empty pairs never burn provider requests on coverage probes/teams/squads.
+    if (res.imported > 0) {
+      const followUps = [
+        { taskKey: `coverage:${competitionId}:${seasonId}`, taskType: 'coverage:discover', priority: 40 },
+        { taskKey: `teams:${competitionId}:${seasonId}`, taskType: 'teams:import', priority: 45 },
+        { taskKey: `standings:sync:${competitionId}:${seasonId}`, taskType: 'standings:sync', priority: 60 },
+        { taskKey: `injuries:sync:${competitionId}:${seasonId}`, taskType: 'injuries:sync', priority: 75 },
+        { taskKey: `odds:sync:${competitionId}:${seasonId}`, taskType: 'odds:sync', priority: 85 },
+      ];
+      for (const f of followUps) {
+        await enqueueTask({ ...f, params: { competitionId, seasonId }, jobId: task.job_id ?? null });
+      }
+    }
+    return { ...res, chainedFollowUps: res.imported > 0 };
+  });
   registerHandler('fixture:details', async (p) => fetchFixtureDetails(Number(p.fixtureId)));
   registerHandler('fixture:postmatch', async (p) => runPostMatchPipeline(Number(p.fixtureId)));
   registerHandler('live:sync', async () => syncLiveFixtures());
@@ -70,46 +87,16 @@ export function registerAllHandlers(): void {
   registerHandler('cache:rebuild', async () => rebuildCache());
 
   // ---- whole-window orchestration -----------------------------------------
-  registerHandler('historical:import', async (p) => {
-    // 1. competitions/seasons, 2. coverage+teams, 3. fixtures → details (via tasks)
+  registerHandler('historical:import', async () => {
+    // 1. competitions/seasons (single /leagues request), 2. fixture imports per
+    // in-scope pair. Coverage/teams/standings/injuries/odds are CHAINED by the
+    // fixtures:import handler — only for pairs that actually have fixtures —
+    // so empty pairs cost exactly ONE request instead of 6+.
     const meta = await importCompetitions();
     const enq = await enqueueSeasonWindowTasks();
-    const rows = await query<{ competition_id: number; season_id: number; year: number }>(
-      `SELECT cs.competition_id, cs.season_id, se.year
-         FROM competition_seasons cs JOIN seasons se ON se.id = cs.season_id
-        WHERE cs.import_scope = 'in_scope'`,
-    );
-    let fixtureTasks = 0;
-    for (const r of rows) {
-      await enqueueTask({
-        taskKey: `fixtures:import:${r.competition_id}:${r.season_id}`,
-        taskType: 'fixtures:import',
-        params: { competitionId: r.competition_id, seasonId: r.season_id },
-        priority: 55,
-      });
-      await enqueueTask({
-        taskKey: `standings:sync:${r.competition_id}:${r.season_id}`,
-        taskType: 'standings:sync',
-        params: { competitionId: r.competition_id, seasonId: r.season_id },
-        priority: 60,
-      });
-      await enqueueTask({
-        taskKey: `injuries:sync:${r.competition_id}:${r.season_id}`,
-        taskType: 'injuries:sync',
-        params: { competitionId: r.competition_id, seasonId: r.season_id },
-        priority: 75,
-      });
-      await enqueueTask({
-        taskKey: `odds:sync:${r.competition_id}:${r.season_id}`,
-        taskType: 'odds:sync',
-        params: { competitionId: r.competition_id, seasonId: r.season_id },
-        priority: 85,
-      });
-      fixtureTasks += 4;
-    }
     await enqueueTask({ taskKey: 'transfers:sync:all', taskType: 'transfers:sync', params: {}, priority: 80 });
     await enqueueTask({ taskKey: 'stats:recalculate:all', taskType: 'stats:recalculate:all', params: {}, priority: 90, scheduledFor: new Date(Date.now() + 60_000) });
-    return { meta, enqueued: enq, fixtureTasks };
+    return { meta, enqueued: enq, fixtureTasks: enq.tasks };
   });
 
   registerHandler('stats:recalculate:all', async () => {

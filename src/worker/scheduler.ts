@@ -12,6 +12,9 @@ import { dispatchDueTasks, getSyncQueue, startWorker, stopWorker } from '../sync
 import { logger } from '../lib/logger.js';
 import { config, ensureSecretsForProduction } from '../config.js';
 import { queryOne } from '../lib/db.js';
+import { reconcileQuota } from '../sync/quota-reconcile.js';
+
+let lastQuotaReconcile = 0;
 
 async function scheduleCycle(): Promise<void> {
   const now = Date.now();
@@ -58,6 +61,13 @@ async function scheduleCycle(): Promise<void> {
     priority: 95,
     scheduledFor: new Date(now + 5 * 60_000),
   });
+
+  // Reconcile quota with the provider's own counters every 15 minutes (live
+  // mode). /status is quota-free, so this runs even in CRITICAL/EXHAUSTED.
+  if (config.providerMode === 'live' && now - lastQuotaReconcile > 15 * 60_000) {
+    lastQuotaReconcile = now;
+    await reconcileQuota().catch((err) => logger.warn({ err: (err as Error).message }, 'quota reconcile failed'));
+  }
 
   await dispatchDueTasks(30);
   logger.debug('scheduler cycle enqueued');

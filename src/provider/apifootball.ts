@@ -2,7 +2,7 @@ import { config } from '../config.js';
 import { logger } from '../lib/logger.js';
 import { query } from '../lib/db.js';
 import { paramStringHash, safeParams } from '../lib/hash.js';
-import { quotaManager } from '../sync/quota.js';
+import { quotaManager, taskClassFor, type TaskClass } from '../sync/quota.js';
 import { AppError, ProviderRequestResult, ProviderResponse } from '../types.js';
 import type { FootballProvider } from './client.js';
 import { storeRawPayload } from './rawstore.js';
@@ -50,19 +50,31 @@ export class ApiFootballClient implements FootballProvider {
     params: Record<string, unknown>,
   ): Promise<ProviderRequestResult<T>> {
     await quotaManager.rollMinuteWindow();
-    const st = await quotaManager.status();
-    if (st.dailyRemaining <= 0) {
-      throw new AppError('Provider quota exhausted for today', 503, 'PROVIDER_QUOTA_EXHAUSTED');
+    // /status is a quota-free management endpoint: always allowed so quota
+    // reconciliation works even when the local state is CRITICAL/EXHAUSTED.
+    if (endpoint !== '/status') {
+      const st = await quotaManager.status();
+      if (st.state === 'EXHAUSTED' || st.dailyRemaining <= 0) {
+        throw new AppError('Provider daily quota exhausted for today', 503, 'PROVIDER_QUOTA_EXHAUSTED');
+      }
+      // Class-aware policy: essential (live/upcoming fixture) sync keeps
+      // running while quota is low; background traffic waits for NORMAL.
+      const explicit = (params as { quotaClass?: string }).quotaClass;
+      const cls: TaskClass =
+        explicit === 'essential' || explicit === 'background' ? explicit : taskClassFor((globalThis as { __syncTaskType?: string }).__syncTaskType);
+      if (cls === 'background' && st.state !== 'NORMAL') {
+        throw new AppError(
+          `Provider quota ${st.state.toLowerCase()} — background traffic deferred (${st.dailyRemaining} of ${st.dailyLimit} requests remaining)`,
+          503,
+          'PROVIDER_QUOTA_DEFERRED',
+        );
+      }
+      await quotaManager.waitForCapacity();
     }
-    const deferred = await quotaManager.shouldDefer(Number((params as { priority?: number }).priority ?? 100));
-    if (deferred) {
-      throw new AppError('Provider quota critical — task deferred', 503, 'PROVIDER_QUOTA_DEFERRED');
-    }
-    await quotaManager.waitForCapacity();
 
     const search = new URLSearchParams();
     for (const [k, v] of Object.entries(params)) {
-      if (v === undefined || v === null || v === '' || k === 'priority') continue;
+      if (v === undefined || v === null || v === '' || k === 'priority' || k === 'quotaClass') continue;
       search.set(k, String(v));
     }
     const qs = search.toString();
@@ -113,7 +125,18 @@ export class ApiFootballClient implements FootballProvider {
 
         const ok = httpStatus === 200;
         if (ok) {
-          await quotaManager.recordUse(dailyRemaining, minuteRemaining);
+          if (endpoint === '/status') {
+            // management endpoint: does not consume quota; its counters are
+            // AUTHORITATIVE and reconcile the local state.
+            const item = (body.response as Array<{ requests?: { current?: number; limit_day?: number } }> | undefined)?.[0];
+            const current = item?.requests?.current;
+            if (typeof current === 'number') {
+              const limitDay = typeof item?.requests?.limit_day === 'number' ? item!.requests!.limit_day : null;
+              await quotaManager.observeExternal(current, limitDay ?? config.providerDailyQuota);
+            }
+          } else {
+            await quotaManager.recordUse(dailyRemaining, minuteRemaining);
+          }
           await storeRawPayload({
             endpoint,
             params,
@@ -121,12 +144,6 @@ export class ApiFootballClient implements FootballProvider {
             responseJson: body,
             httpStatus,
           });
-          if (endpoint === '/status') {
-            const account = (body.response[0] as { account?: { requests?: number } } | undefined)?.account;
-            if (account?.requests !== undefined) {
-              await quotaManager.observeExternal(account.requests, config.providerDailyQuota);
-            }
-          }
         }
         await this.logRequest(endpoint, paramHash, startedAt, t0, httpStatus, ok, dailyRemaining, minuteRemaining, ok ? null : JSON.stringify(body.errors));
 

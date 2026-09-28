@@ -84,17 +84,36 @@ competition/season; unsupported endpoints are never called again.
 
 ## Quota manager (spec §41)
 
-`provider_quota` tracks daily (75 000) and per-minute (300) budgets with
-provider-reported counters adopted when available (`/status`, response headers).
-States: **NORMAL** >50 %, **CAUTION** 20–50 %, **CRITICAL** <20 % remaining.
+`provider_quota` tracks daily (`PROVIDER_DAILY_QUOTA`, default 75 000) and
+per-minute (300) budgets. The provider's own counters are AUTHORITATIVE:
+`/status` (`requests.current` / `requests.limit_day`) and any rate-limit
+response headers override local counting, and the scheduler + `quota:status`
+CLI reconcile every 15 minutes (or on demand). `/status` is quota-free and
+exempt from deferral, so reconciliation works even in CRITICAL/EXHAUSTED.
 
-- CRITICAL: live updates, near-term fixtures and post-match continue; historical
-  refreshes and metadata pulls are deferred (`shouldDefer(priority)`)
-- minute-window exhausted: workers wait for the window to roll (≤60 s)
-- daily exhausted: provider calls stop until the UTC day rolls; the platform
-  (API, stats, cache) keeps serving
+Class-aware tiers (example for 150 000/day: essential reserve 10 000,
+background floor 30 000):
 
-Check: `npm run quota:status`.
+- **NORMAL** — everything runs.
+- **CAUTION** (remaining ≤ background floor): background traffic — historical
+  imports, coverage probes, teams/squads, standings, injuries, odds, transfers,
+  metadata refresh — is DEFERRED with exponential backoff (5 → 10 → 20 → 40 →
+  60 min cap + jitter; deferrals never burn failure attempts). ESSENTIAL
+  traffic keeps running: `live:sync`, `upcoming:sync`, `current:sync`,
+  `postmatch:scan`, `fixture:postmatch`, `fixture:details`.
+  Example: 29 355/150 000 remaining (19.6 %) is CAUTION — live + upcoming
+  fixture sync continues, background imports wait for the daily reset.
+- **CRITICAL** (remaining ≤ essential reserve): only essential sync continues —
+  the reserve exists precisely so live/upcoming sync survives a heavy import day.
+- **EXHAUSTED** (remaining = 0): all provider traffic stops until the UTC day
+  rolls; the platform (API, stats, cache) keeps serving.
+- minute-window exhausted: workers wait for the window to roll (≤60 s).
+
+Tuning: `PROVIDER_ESSENTIAL_RESERVE` (0 = auto ≈ 7 % capped at 10 000) and
+`PROVIDER_BACKGROUND_FLOOR_PERCENT` (default 20).
+
+Check + reconcile: `npm run quota:status` (live mode pulls the provider's own
+counters first).
 
 ## Error handling (spec §51)
 

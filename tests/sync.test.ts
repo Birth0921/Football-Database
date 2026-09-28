@@ -11,7 +11,7 @@ import { importCompetitions, discoverCoverage, getCoverage } from '../src/sync/p
 import { importFixturesForCompetitionSeason, fetchFixtureDetails, runPostMatchPipeline } from '../src/sync/pipelines/fixtures.js';
 import { syncStandings } from '../src/sync/pipelines/misc.js';
 import { n, s } from '../src/provider/mapper.js';
-import { enqueueTask, claimDueTasks, markTaskDone, getTaskByKey, syncSummary } from '../src/sync/tasks.js';
+import { enqueueTask, claimDueTasks, claimTaskById, markTaskDone, getTaskByKey, syncSummary } from '../src/sync/tasks.js';
 import { processTask, registerHandler } from '../src/sync/engine.js';
 import { computeH2H } from '../src/stats/leagues.js';
 import { runDataQualityChecks } from '../src/data-quality.js';
@@ -350,5 +350,79 @@ describe('competitions import (optimized, batched)', () => {
     // previously this was O(leagues×seasons + competitions×years) round trips;
     // the batched importer must stay far below that for the same payload.
     expect(calls).toBeLessThanOrEqual(25);
+  });
+});
+
+describe('quota-aware task scheduling (engine)', () => {
+  it('CAUTION defers background tasks with backoff (no attempt burn) while essential sync still runs', async () => {
+    const { quotaManager } = await import('../src/sync/quota.js');
+    const s0 = await quotaManager.status();
+    // remaining just below the background floor → CAUTION
+    const remaining = Math.max(s0.essentialReserve + 1, s0.backgroundFloor - 500);
+    await quotaManager.observeExternal(s0.dailyLimit - remaining, s0.dailyLimit);
+    expect((await quotaManager.status()).state).toBe('CAUTION');
+
+    try {
+      // background task → deferred, rescheduled, attempts preserved
+      const bgId = await enqueueTask({ taskKey: 'test:defer:bg', taskType: 'teams:import', params: { competitionId: 1, seasonId: 1 }, priority: 5 });
+      const bgClaimed = await claimTaskById(bgId);
+      expect(bgClaimed).toBeTruthy();
+      await processTask(bgClaimed!);
+      const bgRow = await getTaskByKey('test:defer:bg');
+      expect(bgRow!.status).toBe('pending'); // deferred, not failed
+      expect(bgRow!.attempts).toBe(0); // the claim's attempt increment was rolled back
+      expect(Number(bgRow!.quota_defers ?? 0)).toBe(1);
+      expect(new Date(bgRow!.scheduled_for).getTime()).toBeGreaterThan(Date.now() + 4 * 60_000); // ~5 min backoff
+
+      // repeated deferral grows the backoff
+      const bgClaimed2 = await claimTaskById(bgId);
+      await processTask(bgClaimed2!);
+      const bgRow2 = await getTaskByKey('test:defer:bg');
+      expect(Number(bgRow2!.quota_defers ?? 0)).toBe(2);
+      expect(new Date(bgRow2!.scheduled_for).getTime()).toBeGreaterThan(Date.now() + 9 * 60_000);
+
+      // essential task runs straight through the same CAUTION state
+      const essId = await enqueueTask({ taskKey: 'test:defer:essential', taskType: 'live:sync', params: {}, priority: 5 });
+      const essClaimed = await claimTaskById(essId);
+      await processTask(essClaimed!);
+      const essRow = await getTaskByKey('test:defer:essential');
+      expect(essRow!.status).toBe('done'); // live fixture sync is never stopped by CAUTION
+    } finally {
+      await quotaManager.observeExternal(0, s0.dailyLimit); // back to NORMAL
+    }
+    expect((await quotaManager.status()).state).toBe('NORMAL');
+  });
+
+  it('upcoming sync costs ONE request per day (date-based), not one per league', async () => {
+    const { syncUpcomingFixtures } = await import('../src/sync/pipelines/fixtures.js');
+    const before = (await queryOne<{ c: number }>(`SELECT count(*)::int AS c FROM fixtures`))!.c;
+    const res = await syncUpcomingFixtures(7);
+    expect(res.requests).toBe(7); // 7 days × 1 request — independent of league count
+    const after = (await queryOne<{ c: number }>(`SELECT count(*)::int AS c FROM fixtures`))!.c;
+    expect(after).toBeGreaterThanOrEqual(before); // idempotent upserts, never fewer
+  });
+
+  it('fixtures:import chains coverage/teams/standings only for pairs that HAVE fixtures', async () => {
+    const comp = await queryOne<{ id: number }>(`SELECT id FROM competitions WHERE provider_id = '39'`);
+    const season = await queryOne<{ id: number }>(`SELECT id FROM seasons WHERE year = 2026`);
+    const taskKey = `test-chain:fixtures:${comp!.id}:${season!.id}`;
+    const taskId = await enqueueTask({
+      taskKey,
+      taskType: 'fixtures:import',
+      params: { competitionId: comp!.id, seasonId: season!.id, fetchDetails: false },
+      priority: 5,
+    });
+    const claimed = await claimTaskById(taskId);
+    expect(claimed).toBeTruthy();
+    await processTask(claimed!);
+    const row = await getTaskByKey(taskKey);
+    expect(row!.status).toBe('done');
+    expect((row!.result_summary as { imported?: number }).imported).toBeGreaterThan(0);
+    expect((row!.result_summary as { chainedFollowUps?: boolean }).chainedFollowUps).toBe(true);
+    // follow-up tasks exist for this pair
+    for (const key of [`coverage:${comp!.id}:${season!.id}`, `teams:${comp!.id}:${season!.id}`, `standings:sync:${comp!.id}:${season!.id}`]) {
+      const t = await getTaskByKey(key);
+      expect(t, `expected chained task ${key}`).toBeTruthy();
+    }
   });
 });

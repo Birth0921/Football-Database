@@ -131,7 +131,9 @@ internal URL.
 | `JWT_SECRET` | yes (prod) | ≥16 random chars (`openssl rand -hex 32`) |
 | `ADMIN_USER` / `ADMIN_PASSWORD` | yes (prod) | admin dashboard login |
 | `API_PORT` / `WEB_PORT` / `API_HOST` | no | 4000 / 8080 / 0.0.0.0 |
-| `PROVIDER_DAILY_QUOTA` | no | 75000 |
+| `PROVIDER_DAILY_QUOTA` | no | 75000 (your production sets 150000) |
+| `PROVIDER_ESSENTIAL_RESERVE` | no | 0 = auto (~7% of quota, cap 10 000) — kept for live/upcoming sync |
+| `PROVIDER_BACKGROUND_FLOOR_PERCENT` | no | 20 — background imports pause at/below this % remaining |
 | `PROVIDER_MINUTE_LIMIT` | no | 300 |
 | `HISTORICAL_SEASONS_BACK` | no | 3 |
 | `SYNC_LIVE_INTERVAL_SECONDS` | no | 60 |

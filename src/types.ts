@@ -51,6 +51,7 @@ export interface SyncTaskRow {
   status: string;
   attempts: number;
   max_attempts: number;
+  quota_defers: number | null;
   scheduled_for: string;
   started_at: string | null;
   completed_at: string | null;

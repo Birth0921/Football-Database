@@ -11,6 +11,7 @@ import type { AfLeague, AfTeam, AfSquadEntry, AfPlayerInfo } from '../../provide
 import { enqueueTask, upsertJob } from '../tasks.js';
 import { config } from '../../config.js';
 import { logger } from '../../lib/logger.js';
+import { cacheGet, cacheSet } from '../../lib/cache.js';
 
 /** Run `fn` over `items` with a FIXED maximum of concurrent tasks (never unbounded). */
 async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
@@ -357,9 +358,22 @@ export async function importTeamsAndSquads(competitionId: number, seasonId: numb
       [teamId, competitionId, seasonId],
     );
 
-    // squad
-    const squadRes = await provider.get<AfSquadEntry>('/players/squads', { team: teamDto.id });
-    for (const sq of squadRes.data.response) {
+    // squad — /players/squads has no season parameter (it always returns the
+    // CURRENT squad), so the response is cached per team for 12h in live mode:
+    // a team appearing in N seasons costs ONE request per window, not N.
+    let squadEntries: AfSquadEntry[] | null = null;
+    const cacheKey = `sync:squad:${teamDto.id}`;
+    if (config.providerMode === 'live') {
+      squadEntries = await cacheGet<AfSquadEntry[]>(cacheKey);
+    }
+    if (!squadEntries) {
+      const squadRes = await provider.get<AfSquadEntry>('/players/squads', { team: teamDto.id });
+      squadEntries = squadRes.data.response as AfSquadEntry[];
+      if (config.providerMode === 'live') {
+        await cacheSet(cacheKey, squadEntries, 12 * 3600);
+      }
+    }
+    for (const sq of squadEntries) {
       for (const p of sq.players ?? []) {
         const playerPayload: AfPlayerInfo & { number?: number | null; position?: string | null } = {
           id: p.id ?? null,
@@ -423,7 +437,9 @@ export async function importSeasonsCli(): Promise<{ seasons: number }> {
   return { seasons: years.size };
 }
 
-/** Enqueue coverage + teams for every in-scope competition/season. */
+/** Enqueue fixture imports for every in-scope competition/season (current
+ *  seasons first). Coverage/teams/standings follow-ups are chained by the
+ *  fixtures:import handler only for pairs that actually have fixtures. */
 export async function enqueueSeasonWindowTasks(): Promise<{ tasks: number }> {
   const rows = await query<{ competition_id: number; season_id: number }>(
     `SELECT cs.competition_id, cs.season_id
@@ -435,21 +451,14 @@ export async function enqueueSeasonWindowTasks(): Promise<{ tasks: number }> {
   const jobId = await upsertJob(`season-window:${new Date().toISOString().slice(0, 10)}`, 'metadata', { count: rows.length }, 20);
   for (const r of rows) {
     await enqueueTask({
-      taskKey: `coverage:${r.competition_id}:${r.season_id}`,
-      taskType: 'coverage:discover',
+      taskKey: `fixtures:import:${r.competition_id}:${r.season_id}`,
+      taskType: 'fixtures:import',
       params: { competitionId: r.competition_id, seasonId: r.season_id },
-      priority: 40,
-      jobId,
-    });
-    await enqueueTask({
-      taskKey: `teams:${r.competition_id}:${r.season_id}`,
-      taskType: 'teams:import',
-      params: { competitionId: r.competition_id, seasonId: r.season_id },
-      priority: 45,
+      priority: 55,
       jobId,
     });
   }
-  return { tasks: rows.length * 2 };
+  return { tasks: rows.length };
 }
 
 void b;

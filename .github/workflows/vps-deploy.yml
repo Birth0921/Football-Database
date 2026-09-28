@@ -28,10 +28,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install SSH key
+      - name: Check credentials
+        id: creds
         env:
           VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_ENV: ${{ secrets.VPS_ENV }}
         run: |
+          if [ -z "$VPS_SSH_KEY" ]; then
+            echo "missing=ssh" >> "$GITHUB_OUTPUT"
+            echo "::error::VPS_SSH_KEY secret is not set — add it (repo Settings → Secrets → Actions) or deploy manually from your machine."
+            exit 1
+          fi
+          echo "has_env=$([[ -n "$VPS_ENV" ]] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
           mkdir -p ~/.ssh
           printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/vps_key
           chmod 600 ~/.ssh/vps_key
@@ -44,11 +52,17 @@ jobs:
           echo "code transferred"
 
       - name: Write production .env (server-side only)
+        if: steps.creds.outputs.has_env == 'yes'
         env:
           VPS_ENV: ${{ secrets.VPS_ENV }}
         run: |
           printf '%s\n' "$VPS_ENV" | ssh -i ~/.ssh/vps_key "$VPS_USER@$VPS_HOST" "cat > $APP_DIR/.env && chmod 600 $APP_DIR/.env"
           echo ".env written on the server (mode 600)"
+      - name: Keep existing server .env
+        if: steps.creds.outputs.has_env != 'yes'
+        run: |
+          echo "VPS_ENV secret not set — keeping the existing server-side .env untouched""
+
 
       - name: Deploy (docker install, build, start, migrate, health-wait)
         run: |

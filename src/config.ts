@@ -52,6 +52,12 @@ export const config = {
   apiFootballBaseUrl: str('API_FOOTBALL_BASE_URL', 'https://v3.football.api-sports.io'),
   providerDailyQuota: num('PROVIDER_DAILY_QUOTA', 75000),
   providerMinuteLimit: num('PROVIDER_MINUTE_LIMIT', 300),
+  // Quota policy: requests kept aside for essential live/upcoming fixture sync
+  // (0 = auto: ~7% of the daily quota, capped at 10,000). Background traffic
+  // (metadata/historical/imports) pauses once remaining drops to the background
+  // floor: max(2x essential reserve, PROVIDER_BACKGROUND_FLOOR_PERCENT% of quota).
+  providerEssentialReserve: num('PROVIDER_ESSENTIAL_RESERVE', 0),
+  providerBackgroundFloorPercent: num('PROVIDER_BACKGROUND_FLOOR_PERCENT', 20),
   historicalSeasonsBack: num('HISTORICAL_SEASONS_BACK', 3),
   syncLiveIntervalSeconds: num('SYNC_LIVE_INTERVAL_SECONDS', 60),
   syncUpcomingIntervalSeconds: num('SYNC_UPCOMING_INTERVAL_SECONDS', 900),
