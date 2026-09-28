@@ -7,8 +7,9 @@ name: VPS deploy
 # .deploy/reports/ so the deploy can be monitored via git fetch.
 on:
   push:
-    branches: [arena/01a0d445-football-database]
+    branches: [arena/01a0e953-football-database]
     paths: ['.deploy/GO']
+  workflow_dispatch:
 
 concurrency:
   group: vps-deploy
@@ -61,7 +62,7 @@ jobs:
       - name: Keep existing server .env
         if: steps.creds.outputs.has_env != 'yes'
         run: |
-          echo "VPS_ENV secret not set — keeping the existing server-side .env untouched""
+          echo "VPS_ENV secret not set — keeping the existing server-side .env untouched"
 
 
       - name: Deploy (docker install, build, start, migrate, health-wait)

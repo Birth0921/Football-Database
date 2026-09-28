@@ -15,11 +15,36 @@ import { queryOne } from '../lib/db.js';
 import { reconcileQuota } from '../sync/quota-reconcile.js';
 
 let lastQuotaReconcile = 0;
+let bootstrapTaskKey: string | null = null;
 
 async function scheduleCycle(): Promise<void> {
   const now = Date.now();
   const windowKey = `cycle:${Math.floor(now / 60_000)}`;
   await upsertJob(windowKey, 'scheduler', {}, 10);
+
+  // A clean production database has no in-scope pairs after migrations. Queue
+  // one current refresh so the handler can initialise metadata and populate
+  // the public website without requiring a manual historical import.
+  const scope = await queryOne<{ c: number }>(
+    `SELECT count(*)::int AS c FROM competition_seasons WHERE import_scope = 'in_scope'`,
+  );
+  if ((scope?.c ?? 0) === 0) {
+    const key = `bootstrap:current:${new Date().toISOString().slice(0, 10)}`;
+    // set the guard before awaiting the insert because interval callbacks can
+    // overlap while a provider request is in flight.
+    if (bootstrapTaskKey !== key) {
+      bootstrapTaskKey = key;
+      await enqueueTask({
+        taskKey: key,
+        taskType: 'current:sync',
+        params: { daysAhead: 7 },
+        priority: 10,
+      });
+      logger.info('current data bootstrap queued');
+    }
+    await dispatchDueTasks(30);
+    return;
+  }
 
   // live sync: every minute when matches are likely in play, otherwise lazy
   const liveMatches = await queryOne<{ c: number }>(

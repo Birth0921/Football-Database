@@ -5,8 +5,9 @@ name: Public check
 # .deploy/reports/ (readable via git fetch). No credentials involved.
 on:
   push:
-    branches: [arena/01a0d445-football-database]
+    branches: [arena/01a0e953-football-database]
     paths: ['.deploy/CHECK']
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -20,33 +21,49 @@ jobs:
 
       - name: Check public endpoints
         run: |
-          { echo "public check at $(date -u +%FT%TZ)"
+          set -euo pipefail
+          {
+            echo "public check at $(date -u +%FT%TZ)"
             for p in / /admin/api-keys /api/v1/docs /api/v1/health /api/v1/health/data; do
-              code=$(curl -s -o /dev/null -w '%{http_code}' -m 25 "http://158.178.196.221$p")
+              code=$(curl -sS -o /dev/null -w '%{http_code}' -m 25 "http://158.178.196.221$p")
               echo "GET $p -> $code"
+              test "$code" = 200
             done
             echo "--- /api/v1/health body:"
-            curl -s -m 25 http://158.178.196.221/api/v1/health | head -c 400
+            health=$(curl -fsS -m 25 http://158.178.196.221/api/v1/health)
+            printf '%s\n' "${health:0:400}"
             echo
             echo "--- /api/v1/health/data body:"
-            curl -s -m 25 http://158.178.196.221/api/v1/health/data | head -c 600
+            data_health=$(curl -fsS -m 25 http://158.178.196.221/api/v1/health/data)
+            printf '%s\n' "${data_health:0:600}"
             echo
             echo "--- /api/v1/fixtures (anonymous via website proxy; total must be > 0):"
-            curl -s -m 25 "http://158.178.196.221/api/v1/fixtures?per_page=1" | head -c 400
+            fixtures=$(curl -fsS -m 25 "http://158.178.196.221/api/v1/fixtures?per_page=1")
+            printf '%s\n' "${fixtures:0:400}"
             echo
+            jq -e '(.ok == true and (.pagination.total // 0) > 0)' >/dev/null <<<"$fixtures"
+            echo "fixture data check: PASS"
             echo "--- provider quota (/api/v1/health/provider):"
-            curl -s -m 25 http://158.178.196.221/api/v1/health/provider | head -c 500
+            provider=$(curl -fsS -m 25 http://158.178.196.221/api/v1/health/provider)
+            printf '%s\n' "${provider:0:500}"
             echo
             echo "--- frontend markers:"
-            curl -s -m 25 http://158.178.196.221/ | grep -o -m1 'hero-kicker\|fixture-toggle' | head -1
+            homepage=$(curl -fsS -m 25 http://158.178.196.221/)
+            grep -o -m1 'hero-kicker\|fixture-toggle' <<<"$homepage"
           } | tee /tmp/check.txt
 
       - name: Publish result to the repo
+        if: always()
         run: |
           git config user.name "check-bot"
           git config user.email "check-bot@users.noreply.github.com"
           mkdir -p .deploy/reports
-          cp /tmp/check.txt ".deploy/reports/check-$(date -u +%Y%m%dT%H%M%S).txt"
+          report=".deploy/reports/check-$(date -u +%Y%m%dT%H%M%S).txt"
+          if [ -f /tmp/check.txt ]; then
+            cp /tmp/check.txt "$report"
+          else
+            echo "public check did not complete; inspect the workflow log" > "$report"
+          fi
           git add .deploy/reports
           git commit -m "public check result (bot)" || echo "nothing to commit"
           git push

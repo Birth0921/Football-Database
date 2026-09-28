@@ -78,7 +78,8 @@
   }
 
   /* ---------------- fixtures ---------------- */
-  let fixtureSegment = 'live';
+  // Live matches are often empty outside kick-off windows; show useful upcoming data on landing.
+  let fixtureSegment = 'upcoming';
 
   function fixtureCard(f) {
     const isLive = LIVE.includes(f.status_short);

@@ -61,7 +61,19 @@ if [ "$API_OK" != "1" ]; then
   exit 1
 fi
 log "API healthy ✔"
+
+# Make the public site useful immediately after a clean deploy. The current
+# sync lazily imports lightweight competition/season metadata when the database
+# has no in-scope pairs, then fetches the next seven days and live scores. It is
+# idempotent and deliberately does not run the expensive historical import.
+log "warming current fixtures (metadata + next seven days)…"
+if $DOCKER compose run --rm --no-deps api npm run current:sync -- --days 7; then
+  log "current fixtures warmed ✔"
+else
+  log "WARNING: current fixture warm-up failed; scheduler will retry it"
+fi
+
 log "service status:"
 $DOCKER compose ps
 log "done. Verify with: scripts/deploy/vps-verify.sh"
-log "then bootstrap data: see DEPLOYMENT.md §Bootstrap"
+log "for historical coverage, run: bash scripts/deploy/vps-bootstrap.sh"

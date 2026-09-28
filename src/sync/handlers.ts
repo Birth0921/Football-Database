@@ -12,6 +12,7 @@ import { recalculateAllPlayers, recalculatePlayersForFixture } from '../stats/pl
 import { recalculateAllLeagues, recalculateLeagueSeason, rebuildAllH2H } from '../stats/leagues.js';
 import { rebuildPredictionFeatures, buildPredictionFeature } from '../stats/predictions.js';
 import { enqueueTask } from './tasks.js';
+import { queryOne } from '../lib/db.js';
 import { rebuildCache } from '../lib/cache-rebuild.js';
 
 let registered = false;
@@ -111,6 +112,15 @@ export function registerAllHandlers(): void {
   });
 
   registerHandler('current:sync', async () => {
+    // A fresh deployment has migrations but no competition/season scope yet.
+    // Initialise just the metadata needed for a current refresh instead of
+    // leaving the public website empty until somebody runs the full historical
+    // bootstrap manually. This remains idempotent and does not import history.
+    const scope = await queryOne<{ c: number }>(
+      `SELECT count(*)::int AS c FROM competition_seasons WHERE import_scope = 'in_scope'`,
+    );
+    if ((scope?.c ?? 0) === 0) await importCompetitions();
+
     // high-priority current-season refresh cycle
     await syncUpcomingFixtures(7);
     const live = await syncLiveFixtures();

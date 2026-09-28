@@ -54,13 +54,15 @@ describe('frontend UX mechanisms are present', () => {
     expect(appJs.includes('No fixtures available')).toBe(true);
   });
 
-  it('has the Live/Upcoming/Finished toggle (segmented control, keyboard accessible)', () => {
+  it('has the Live/Upcoming/Finished toggle and lands on upcoming data', () => {
     expect(indexHtml.includes('fixture-toggle')).toBe(true);
     expect(indexHtml.includes('data-seg="live"')).toBe(true);
     expect(indexHtml.includes('data-seg="upcoming"')).toBe(true);
     expect(indexHtml.includes('data-seg="finished"')).toBe(true);
     expect(indexHtml.includes('role="tablist"')).toBe(true);
     expect(indexHtml.includes('aria-selected')).toBe(true);
+    expect(indexHtml.includes('data-seg="upcoming" role="tab" aria-selected="true"')).toBe(true);
+    expect(appJs.includes("let fixtureSegment = 'upcoming'" )).toBe(true);
   });
 
   it('has a toast/notification system in a consistent, aria-live location', () => {

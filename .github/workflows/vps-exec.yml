@@ -6,8 +6,9 @@ name: VPS exec
 # The output report is pushed to .deploy/reports/ (secrets redacted).
 on:
   push:
-    branches: [arena/01a0d445-football-database]
+    branches: [arena/01a0e953-football-database]
     paths: ['.deploy/command']
+  workflow_dispatch:
 
 concurrency:
   group: vps-exec
