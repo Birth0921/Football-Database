@@ -12,7 +12,13 @@ export async function syncStandings(competitionId: number, seasonId: number): Pr
   if (coverage?.standings === false) return { rows: 0 };
   const provider = await getProvider();
   const ids = await queryOne<{ provider_id: string; season_year: number }>(
-    `SELECT c.provider_id, se.year AS season_year FROM competitions c, seasons se WHERE c.id = $1 AND se.id = $2`,
+    `SELECT c.provider_id, se.year AS season_year
+       FROM competition_seasons cs
+       JOIN competitions c ON c.id = cs.competition_id
+       JOIN seasons se ON se.id = cs.season_id
+      WHERE cs.competition_id = $1 AND cs.season_id = $2
+        AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+        AND cs.import_scope = 'in_scope' AND se.import_scope = 'in_scope'`,
     [competitionId, seasonId],
   );
   if (!ids) throw new Error(`competition/season not found: ${competitionId}/${seasonId}`);
@@ -32,7 +38,13 @@ export async function syncInjuries(competitionId: number, seasonId: number): Pro
   if (coverage?.injuries === false) return { records: 0 };
   const provider = await getProvider();
   const ids = await queryOne<{ provider_id: string; season_year: number }>(
-    `SELECT c.provider_id, se.year AS season_year FROM competitions c, seasons se WHERE c.id = $1 AND se.id = $2`,
+    `SELECT c.provider_id, se.year AS season_year
+       FROM competition_seasons cs
+       JOIN competitions c ON c.id = cs.competition_id
+       JOIN seasons se ON se.id = cs.season_id
+      WHERE cs.competition_id = $1 AND cs.season_id = $2
+        AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+        AND cs.import_scope = 'in_scope' AND se.import_scope = 'in_scope'`,
     [competitionId, seasonId],
   );
   if (!ids) throw new Error(`competition/season not found: ${competitionId}/${seasonId}`);
@@ -95,7 +107,13 @@ export async function syncOdds(competitionId: number, seasonId: number): Promise
   if (coverage?.odds === false) return { records: 0 };
   const provider = await getProvider();
   const ids = await queryOne<{ provider_id: string; season_year: number }>(
-    `SELECT c.provider_id, se.year AS season_year FROM competitions c, seasons se WHERE c.id = $1 AND se.id = $2`,
+    `SELECT c.provider_id, se.year AS season_year
+       FROM competition_seasons cs
+       JOIN competitions c ON c.id = cs.competition_id
+       JOIN seasons se ON se.id = cs.season_id
+      WHERE cs.competition_id = $1 AND cs.season_id = $2
+        AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+        AND cs.import_scope = 'in_scope' AND se.import_scope = 'in_scope'`,
     [competitionId, seasonId],
   );
   if (!ids) throw new Error(`competition/season not found: ${competitionId}/${seasonId}`);

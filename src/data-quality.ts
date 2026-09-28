@@ -1,5 +1,6 @@
 /** Data-quality checks (spec §46) with results persisted for /health/data. */
 import { query, queryOne } from './lib/db.js';
+import { config } from './config.js';
 
 export interface QualityCheck {
   key: string;
@@ -100,6 +101,40 @@ export async function runDataQualityChecks(opts: { persist?: boolean } = {}): Pr
     key: 'api_keys_hashed_only',
     status: (keysWithoutHash?.c ?? 0) === 0 ? 'PASS' : 'FAIL',
     message: `${keysWithoutHash?.c ?? 0} api keys without secure hash`,
+  });
+
+  const outOfScopeCompetitions = await queryOne<{ c: number }>(
+    `SELECT count(*)::int AS c FROM competitions
+      WHERE active = TRUE AND (import_tier IS NULL OR import_tier NOT BETWEEN 1 AND 3)`,
+  );
+  checks.push({
+    key: 'approved_competition_scope',
+    status: (outOfScopeCompetitions?.c ?? 0) === 0 ? 'PASS' : 'FAIL',
+    message: `${outOfScopeCompetitions?.c ?? 0} active competitions outside approved Tier 1–3 scope`,
+  });
+
+  const outOfScopeSeasons = await queryOne<{ c: number }>(
+    `SELECT count(*)::int AS c FROM seasons WHERE import_scope = 'in_scope' AND NOT (year = ANY($1::int[]))`,
+    [config.importSeasons],
+  );
+  checks.push({
+    key: 'approved_season_scope',
+    status: (outOfScopeSeasons?.c ?? 0) === 0 ? 'PASS' : 'FAIL',
+    message: `${outOfScopeSeasons?.c ?? 0} in-scope seasons outside ${config.importSeasons.join(', ')}`,
+  });
+
+  const scopedFixtures = await queryOne<{ c: number }>(
+    `SELECT count(*)::int AS c FROM fixtures f
+       JOIN competitions c ON c.id = f.competition_id
+       JOIN seasons se ON se.id = f.season_id
+       JOIN competition_seasons cs ON cs.competition_id = f.competition_id AND cs.season_id = f.season_id
+      WHERE c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+        AND se.import_scope = 'in_scope' AND cs.import_scope = 'in_scope'`,
+  );
+  checks.push({
+    key: 'scoped_fixture_data_available',
+    status: (scopedFixtures?.c ?? 0) > 0 ? 'PASS' : 'WARN',
+    message: `${scopedFixtures?.c ?? 0} fixtures in the approved competition/season scope`,
   });
 
   const passed = checks.filter((c) => c.status === 'PASS').length;

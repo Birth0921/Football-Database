@@ -78,7 +78,9 @@ export function createApp(): Express {
     const country = req.query.country ? String(req.query.country) : null;
     const cached = await cacheGet<unknown>(cacheKeys.competitions());
     if (cached && !country) return res.json(cached);
-    const where = country ? `WHERE lower(co.name) = lower($1)` : '';
+    const where = country
+      ? `WHERE c.active = TRUE AND c.import_tier BETWEEN 1 AND 3 AND lower(co.name) = lower($1)`
+      : `WHERE c.active = TRUE AND c.import_tier BETWEEN 1 AND 3`;
     const total = (await queryOne<{ c: number }>(
       `SELECT count(*)::int AS c FROM competitions c ${country ? 'JOIN countries co ON co.id = c.country_id' : ''} ${where}`,
       country ? [country] : [],
@@ -95,7 +97,8 @@ export function createApp(): Express {
   }));
   v1.get('/competitions/:id', asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const row = await queryOne(`SELECT c.*, co.name AS country_name FROM competitions c LEFT JOIN countries co ON co.id = c.country_id WHERE c.id = $1`, [id]);
+    const row = await queryOne(`SELECT c.*, co.name AS country_name FROM competitions c LEFT JOIN countries co ON co.id = c.country_id
+      WHERE c.id = $1 AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3`, [id]);
     if (!row) throw new NotFoundError(`competition ${id} not found`);
     res.json({ ok: true, data: row });
   }));
@@ -105,9 +108,12 @@ export function createApp(): Express {
       `SELECT se.*, cs.is_current AS linked_current, cs.import_scope,
               to_jsonb(cov) - 'id' - 'competition_season_id' AS coverage
          FROM competition_seasons cs
+         JOIN competitions c ON c.id = cs.competition_id
          JOIN seasons se ON se.id = cs.season_id
          LEFT JOIN competition_season_coverage cov ON cov.competition_season_id = cs.id
-        WHERE cs.competition_id = $1 ORDER BY se.year DESC`,
+        WHERE cs.competition_id = $1 AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+          AND se.import_scope = 'in_scope' AND cs.import_scope = 'in_scope'
+        ORDER BY se.year DESC`,
       [id],
     );
     res.json({ ok: true, data: rows });
@@ -117,7 +123,13 @@ export function createApp(): Express {
     const seasonId = Number(req.query.season_id);
     if (!seasonId) throw new AppError('season_id query parameter required', 400, 'VALIDATION');
     const row = await queryOne(
-      `SELECT * FROM league_season_statistics WHERE competition_id = $1 AND season_id = $2`,
+      `SELECT lss.* FROM league_season_statistics lss
+         JOIN competitions c ON c.id = lss.competition_id
+         JOIN seasons se ON se.id = lss.season_id
+         JOIN competition_seasons cs ON cs.competition_id = lss.competition_id AND cs.season_id = lss.season_id
+        WHERE lss.competition_id = $1 AND lss.season_id = $2
+          AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+          AND se.import_scope = 'in_scope' AND cs.import_scope = 'in_scope'`,
       [id, seasonId],
     );
     res.json({ ok: true, data: row ?? null });
@@ -126,11 +138,29 @@ export function createApp(): Express {
   // ---- teams --------------------------------------------------------------
   v1.get('/teams', asyncHandler(async (req, res) => {
     const { page, perPage, offset } = pagination(req);
-    const conds: string[] = [];
+    const conds: string[] = [
+      `EXISTS (
+         SELECT 1 FROM team_seasons ts
+         JOIN competitions c ON c.id = ts.competition_id
+         JOIN seasons se ON se.id = ts.season_id
+         JOIN competition_seasons cs ON cs.competition_id = ts.competition_id AND cs.season_id = ts.season_id
+        WHERE ts.team_id = t.id AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+          AND se.import_scope = 'in_scope' AND cs.import_scope = 'in_scope'
+       )`,
+    ];
     const params: unknown[] = [];
     if (req.query.competition_id) {
       params.push(Number(req.query.competition_id), Number(req.query.season_id ?? 0));
-      conds.push(`EXISTS (SELECT 1 FROM team_seasons ts WHERE ts.team_id = t.id AND ts.competition_id = $${params.length - 1} AND ($${params.length} = 0 OR ts.season_id = $${params.length}))`);
+      conds.push(`EXISTS (
+        SELECT 1 FROM team_seasons ts
+        JOIN competitions c ON c.id = ts.competition_id
+        JOIN seasons se ON se.id = ts.season_id
+        JOIN competition_seasons cs ON cs.competition_id = ts.competition_id AND cs.season_id = ts.season_id
+        WHERE ts.team_id = t.id AND ts.competition_id = $${params.length - 1}
+          AND ($${params.length} = 0 OR ts.season_id = $${params.length})
+          AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+          AND se.import_scope = 'in_scope' AND cs.import_scope = 'in_scope'
+      )`);
     }
     if (req.query.name) {
       params.push(`%${String(req.query.name)}%`);
@@ -148,7 +178,15 @@ export function createApp(): Express {
     const row = await queryOne(
       `SELECT t.*, v.name AS venue_name, v.city AS venue_city, co.name AS country_name
          FROM teams t LEFT JOIN venues v ON v.id = t.venue_id LEFT JOIN countries co ON co.id = t.country_id
-        WHERE t.id = $1`,
+        WHERE t.id = $1
+          AND EXISTS (
+            SELECT 1 FROM team_seasons ts
+            JOIN competitions c ON c.id = ts.competition_id
+            JOIN seasons se ON se.id = ts.season_id
+            JOIN competition_seasons cs ON cs.competition_id = ts.competition_id AND cs.season_id = ts.season_id
+            WHERE ts.team_id = t.id AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+              AND se.import_scope = 'in_scope' AND cs.import_scope = 'in_scope'
+          )`,
       [id],
     );
     if (!row) throw new NotFoundError(`team ${id} not found`);
@@ -161,7 +199,13 @@ export function createApp(): Express {
     const seasonId = Number(req.query.season_id);
     if (!competitionId || !seasonId) throw new AppError('competition_id and season_id query parameters required', 400, 'VALIDATION');
     const row = await queryOne(
-      `SELECT * FROM team_competition_season_stats WHERE team_id = $1 AND competition_id = $2 AND season_id = $3`,
+      `SELECT stats.* FROM team_competition_season_stats stats
+         JOIN competitions c ON c.id = stats.competition_id
+         JOIN seasons se ON se.id = stats.season_id
+         JOIN competition_seasons cs ON cs.competition_id = stats.competition_id AND cs.season_id = stats.season_id
+        WHERE stats.team_id = $1 AND stats.competition_id = $2 AND stats.season_id = $3
+          AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+          AND se.import_scope = 'in_scope' AND cs.import_scope = 'in_scope'`,
       [id, competitionId, seasonId],
     );
     res.json({ ok: true, data: row ?? null });
@@ -265,8 +309,11 @@ export function createApp(): Express {
   const fixtureJoin = `FROM fixtures f
     LEFT JOIN teams ht ON ht.id = f.home_team_id
     LEFT JOIN teams at ON at.id = f.away_team_id
-    LEFT JOIN competitions c ON c.id = f.competition_id
-    LEFT JOIN seasons se ON se.id = f.season_id
+    JOIN competitions c ON c.id = f.competition_id
+      AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+    JOIN seasons se ON se.id = f.season_id AND se.import_scope = 'in_scope'
+    JOIN competition_seasons cs ON cs.competition_id = f.competition_id
+      AND cs.season_id = f.season_id AND cs.import_scope = 'in_scope'
     LEFT JOIN venues v ON v.id = f.venue_id`;
   const fixtureCols = `f.*, ht.name AS home_team_name, at.name AS away_team_name,
        ht.logo_url AS home_team_logo, at.logo_url AS away_team_logo,
@@ -340,8 +387,8 @@ export function createApp(): Express {
   v1.get('/fixtures/:id', asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
     const cached = await cacheGet(cacheKeys.fixture(id));
+    const row = await fixtureDetail(id); // scope-check before serving a cached row
     if (cached) return res.json({ ok: true, data: cached, cached: true });
-    const row = await fixtureDetail(id);
     await cacheSet(cacheKeys.fixture(id), row, CACHE_TTL.fixtureDetail);
     res.json({ ok: true, data: row });
   }));
@@ -403,14 +450,27 @@ export function createApp(): Express {
     const key = cacheKeys.standings({ competitionId, seasonId });
     const cached = await cacheGet(key);
     if (cached) return res.json({ ok: true, data: cached, cached: true });
-    const standings = await query(`SELECT * FROM standings WHERE competition_season_id = (SELECT id FROM competition_seasons WHERE competition_id = $1 AND season_id = $2)`, [competitionId, seasonId]);
+    const standings = await query(
+      `SELECT s.* FROM standings s
+         JOIN competition_seasons cs ON cs.id = s.competition_season_id
+         JOIN competitions c ON c.id = cs.competition_id
+         JOIN seasons se ON se.id = cs.season_id
+        WHERE cs.competition_id = $1 AND cs.season_id = $2
+          AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+          AND se.import_scope = 'in_scope' AND cs.import_scope = 'in_scope'`,
+      [competitionId, seasonId],
+    );
     const rows = await query(
       `SELECT sr.*, t.name AS team_name, t.logo_url
          FROM standing_rows sr
          JOIN standings s ON s.id = sr.standings_id
          JOIN competition_seasons cs ON cs.id = s.competition_season_id
+         JOIN competitions c ON c.id = cs.competition_id
+         JOIN seasons se ON se.id = cs.season_id
          JOIN teams t ON t.id = sr.team_id
         WHERE cs.competition_id = $1 AND cs.season_id = $2
+          AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+          AND se.import_scope = 'in_scope' AND cs.import_scope = 'in_scope'
         ORDER BY sr.rank ASC NULLS LAST`,
       [competitionId, seasonId],
     );

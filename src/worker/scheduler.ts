@@ -26,7 +26,14 @@ async function scheduleCycle(): Promise<void> {
   // one current refresh so the handler can initialise metadata and populate
   // the public website without requiring a manual historical import.
   const scope = await queryOne<{ c: number }>(
-    `SELECT count(*)::int AS c FROM competition_seasons WHERE import_scope = 'in_scope'`,
+    `SELECT count(*)::int AS c
+       FROM competition_seasons cs
+       JOIN competitions c ON c.id = cs.competition_id
+       JOIN seasons se ON se.id = cs.season_id
+      WHERE cs.import_scope = 'in_scope'
+        AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+        AND se.year = $1`,
+    [config.currentImportSeason],
   );
   if ((scope?.c ?? 0) === 0) {
     const key = `bootstrap:current:${new Date().toISOString().slice(0, 10)}`;
@@ -48,7 +55,15 @@ async function scheduleCycle(): Promise<void> {
 
   // live sync: every minute when matches are likely in play, otherwise lazy
   const liveMatches = await queryOne<{ c: number }>(
-    `SELECT count(*)::int AS c FROM fixtures WHERE status_short IN ('1H','HT','2H','ET','BT','P','INT')`,
+    `SELECT count(*)::int AS c
+       FROM fixtures f
+       JOIN competitions c ON c.id = f.competition_id
+       JOIN seasons se ON se.id = f.season_id
+       JOIN competition_seasons cs ON cs.competition_id = f.competition_id AND cs.season_id = f.season_id
+      WHERE f.status_short IN ('1H','HT','2H','ET','BT','P','INT')
+        AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+        AND se.year = $1 AND se.import_scope = 'in_scope' AND cs.import_scope = 'in_scope'`,
+    [config.currentImportSeason],
   );
   const day = new Date().getUTCDay();
   const hour = new Date().getUTCHours();
@@ -64,13 +79,24 @@ async function scheduleCycle(): Promise<void> {
   await enqueueTask({
     taskKey: `upcoming:sync:${Math.floor(now / (config.syncUpcomingIntervalSeconds * 1000))}`,
     taskType: 'upcoming:sync',
-    params: { daysAhead: 7 },
+    params: { daysAhead: 7, daysBack: 0 },
     priority: 20,
+  });
+
+  // Reconcile the previous two days once per UTC day. This is separate from
+  // the 15-minute upcoming window so the normal task does not duplicate date
+  // requests.
+  await enqueueTask({
+    taskKey: `recent:sync:${new Date(now).toISOString().slice(0, 10)}`,
+    taskType: 'upcoming:sync',
+    params: { daysAhead: 0, daysBack: 2 },
+    priority: 22,
   });
 
   await enqueueTask({
     taskKey: `postmatch:scan:${Math.floor(now / (config.syncPostmatchIntervalSeconds * 1000))}`,
     taskType: 'postmatch:scan',
+    params: { sinceDays: 3 },
     priority: 25,
   });
 

@@ -61,7 +61,9 @@ export class ApiFootballClient implements FootballProvider {
       // running while quota is low; background traffic waits for NORMAL.
       const explicit = (params as { quotaClass?: string }).quotaClass;
       const cls: TaskClass =
-        explicit === 'essential' || explicit === 'background' ? explicit : taskClassFor((globalThis as { __syncTaskType?: string }).__syncTaskType);
+        explicit === 'essential' || explicit === 'background'
+          ? explicit
+          : taskClassFor((globalThis as { __syncTaskType?: string }).__syncTaskType);
       if (cls === 'background' && st.state !== 'NORMAL') {
         throw new AppError(
           `Provider quota ${st.state.toLowerCase()} — background traffic deferred (${st.dailyRemaining} of ${st.dailyLimit} requests remaining)`,

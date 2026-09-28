@@ -37,6 +37,24 @@ function bool(name: string, def: boolean): boolean {
   return ['1', 'true', 'yes', 'on'].includes(v.toLowerCase());
 }
 
+/** The production importer is intentionally pinned to this four-season window. */
+export const IMPORT_SEASONS = [2023, 2024, 2025, 2026] as const;
+export const CURRENT_IMPORT_SEASON = 2026 as const;
+
+function parseImportSeasons(): number[] {
+  const raw = process.env.IMPORT_SEASONS ?? IMPORT_SEASONS.join(',');
+  const values = raw.split(',').map((part) => Number(part.trim()));
+  if (values.length !== IMPORT_SEASONS.length || values.some((year) => !Number.isInteger(year))) {
+    throw new Error(`IMPORT_SEASONS must be exactly ${IMPORT_SEASONS.join(',')}`);
+  }
+  const expected = new Set<number>(IMPORT_SEASONS);
+  const actual = new Set(values);
+  if (actual.size !== expected.size || values.some((year) => !expected.has(year))) {
+    throw new Error(`IMPORT_SEASONS must be exactly ${IMPORT_SEASONS.join(',')}`);
+  }
+  return [...IMPORT_SEASONS];
+}
+
 export const config = {
   nodeEnv: str('NODE_ENV', 'development'),
   databaseUrl: process.env.DATABASE_URL ?? 'postgres://postgres:password@127.0.0.1:5432/football',
@@ -58,6 +76,10 @@ export const config = {
   // floor: max(2x essential reserve, PROVIDER_BACKGROUND_FLOOR_PERCENT% of quota).
   providerEssentialReserve: num('PROVIDER_ESSENTIAL_RESERVE', 0),
   providerBackgroundFloorPercent: num('PROVIDER_BACKGROUND_FLOOR_PERCENT', 20),
+  // IMPORT_SEASONS is strict: no provider season outside 2023–2026 may enter
+  // the import scope, regardless of what /leagues returns.
+  importSeasons: parseImportSeasons(),
+  currentImportSeason: CURRENT_IMPORT_SEASON,
   historicalSeasonsBack: num('HISTORICAL_SEASONS_BACK', 3),
   syncLiveIntervalSeconds: num('SYNC_LIVE_INTERVAL_SECONDS', 60),
   syncUpcomingIntervalSeconds: num('SYNC_UPCOMING_INTERVAL_SECONDS', 900),

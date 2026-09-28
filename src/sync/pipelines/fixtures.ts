@@ -16,6 +16,8 @@ import { getCoverage } from './metadata.js';
 import { COMPLETED_STATUSES } from '../../types.js';
 import { logger } from '../../lib/logger.js';
 import { invalidateFixture } from '../../lib/cache.js';
+import { config } from '../../config.js';
+import { isCurrentImportSeason } from '../import-scope.js';
 
 async function resolveFixtureIds(f: AfFixture) {
   const competition = f.league?.id != null
@@ -61,11 +63,28 @@ export interface ImportFixturesResult {
 /** Import all fixtures for a competition/season (historical + current). */
 export async function importFixturesForCompetitionSeason(competitionId: number, seasonId: number, opts: { fetchDetails?: boolean } = {}): Promise<ImportFixturesResult> {
   const provider = await getProvider();
-  const ids = await queryOne<{ provider_id: string; season_year: number }>(
-    `SELECT c.provider_id, se.year AS season_year FROM competitions c, seasons se WHERE c.id = $1 AND se.id = $2`,
+  const ids = await queryOne<{ provider_id: string; season_year: number; historical_imported_at: string | null }>(
+    `SELECT c.provider_id, se.year AS season_year, cs.historical_imported_at
+       FROM competitions c
+       JOIN competition_seasons cs ON cs.competition_id = c.id
+       JOIN seasons se ON se.id = cs.season_id
+      WHERE c.id = $1 AND se.id = $2
+        AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+        AND cs.import_scope = 'in_scope'`,
     [competitionId, seasonId],
   );
-  if (!ids) throw new Error(`competition/season not found: ${competitionId}/${seasonId}`);
+  if (!ids || !config.importSeasons.includes(ids.season_year)) throw new Error(`competition/season outside import scope: ${competitionId}/${seasonId}`);
+
+  // A completed historical window is immutable for the importer. Return the
+  // stored count without issuing another provider request; task keys remain
+  // resumable when the first attempt failed before this marker was written.
+  if (!isCurrentImportSeason(ids.season_year) && ids.historical_imported_at) {
+    const existing = await queryOne<{ c: number }>(
+      `SELECT count(*)::int AS c FROM fixtures WHERE competition_id = $1 AND season_id = $2`,
+      [competitionId, seasonId],
+    );
+    return { imported: existing?.c ?? 0, changed: 0, completed: 0, enqueuedDetails: 0 };
+  }
 
   const res = await provider.get<AfFixture>('/fixtures', { league: ids.provider_id, season: ids.season_year });
   const result: ImportFixturesResult = { imported: 0, changed: 0, completed: 0, enqueuedDetails: 0 };
@@ -82,11 +101,16 @@ export async function importFixturesForCompetitionSeason(competitionId: number, 
     // Historical completed + already fully populated → skip details (immutable).
     const needDetails = await fixtureNeedsDetails(up.fixtureId, up.completed);
     if (needDetails && detailJobId !== null) {
-      const priority = up.justCompleted ? 30 : up.completed ? 70 : 20;
+      const priority = isCurrentImportSeason(ids.season_year)
+        ? (up.justCompleted ? 30 : up.completed ? 70 : 20)
+        : 80;
       await enqueueTask({
         taskKey: `fixture-details:${up.fixtureId}`,
         taskType: 'fixture:details',
-        params: { fixtureId: up.fixtureId },
+        params: {
+          fixtureId: up.fixtureId,
+          quotaClass: isCurrentImportSeason(ids.season_year) ? 'essential' : 'background',
+        },
         priority,
         jobId: detailJobId,
       });
@@ -96,11 +120,21 @@ export async function importFixturesForCompetitionSeason(competitionId: number, 
       await enqueueTask({
         taskKey: `postmatch:${up.fixtureId}`,
         taskType: 'fixture:postmatch',
-        params: { fixtureId: up.fixtureId },
-        priority: 25,
+        params: {
+          fixtureId: up.fixtureId,
+          quotaClass: isCurrentImportSeason(ids.season_year) ? 'essential' : 'background',
+        },
+        priority: isCurrentImportSeason(ids.season_year) ? 25 : 85,
       });
     }
     await invalidateFixture(up.fixtureId);
+  }
+  if (!isCurrentImportSeason(ids.season_year)) {
+    await query(
+      `UPDATE competition_seasons SET historical_imported_at = now(), updated_at = now()
+        WHERE competition_id = $1 AND season_id = $2 AND import_scope = 'in_scope'`,
+      [competitionId, seasonId],
+    );
   }
   logger.info({ competitionId, seasonId, ...result }, 'fixtures imported');
   return result;
@@ -128,34 +162,44 @@ async function fixtureNeedsDetails(fixtureId: number, completed: boolean): Promi
 }
 
 /** Fetch events/statistics/players/lineups for one fixture (respects coverage). */
-export async function fetchFixtureDetails(fixtureId: number): Promise<{ events: number; teamStats: number; playerStats: number; lineups: number }> {
+export async function fetchFixtureDetails(fixtureId: number, quotaClass?: 'essential' | 'background'): Promise<{ events: number; teamStats: number; playerStats: number; lineups: number }> {
   const provider = await getProvider();
   const fx = await queryOne<{
-    id: number; provider_fixture_id: string; competition_id: number | null; season_id: number | null;
+    id: number; provider_fixture_id: string; competition_id: number; season_id: number;
     status_short: string; finalized: boolean;
-  }>(`SELECT id, provider_fixture_id, competition_id, season_id, status_short, finalized FROM fixtures WHERE id = $1`, [fixtureId]);
+  }>(
+    `SELECT f.id, f.provider_fixture_id, f.competition_id, f.season_id, f.status_short, f.finalized
+       FROM fixtures f
+       JOIN competitions c ON c.id = f.competition_id
+       JOIN seasons se ON se.id = f.season_id
+       JOIN competition_seasons cs ON cs.competition_id = f.competition_id AND cs.season_id = f.season_id
+      WHERE f.id = $1 AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+        AND se.import_scope = 'in_scope' AND cs.import_scope = 'in_scope'`,
+    [fixtureId],
+  );
   if (!fx) throw new Error(`fixture ${fixtureId} not found`);
   if (fx.finalized) return { events: 0, teamStats: 0, playerStats: 0, lineups: 0 };
 
   const coverage = fx.competition_id && fx.season_id ? await getCoverage(fx.competition_id, fx.season_id) : null;
   const out = { events: 0, teamStats: 0, playerStats: 0, lineups: 0 };
   const pFixture = fx.provider_fixture_id;
+  const quotaParams = quotaClass ? { quotaClass } : {};
   const live = ['1H', 'HT', '2H', 'ET', 'P'].includes(fx.status_short);
 
   if (!coverage || coverage.events !== false) {
-    const res = await provider.get<AfEvent>('/fixtures/events', { fixture: pFixture });
+    const res = await provider.get<AfEvent>('/fixtures/events', { fixture: pFixture, ...quotaParams });
     out.events = await replaceFixtureEvents(fixtureId, res.data.response as AfEvent[]);
   }
   if (!coverage || coverage.fixture_statistics !== false) {
-    const res = await provider.get<AfTeamStatEntry>('/fixtures/statistics', { fixture: pFixture });
+    const res = await provider.get<AfTeamStatEntry>('/fixtures/statistics', { fixture: pFixture, ...quotaParams });
     out.teamStats = await upsertFixtureTeamStatistics(fixtureId, res.data.response as AfTeamStatEntry[]);
   }
   if ((!coverage || coverage.player_statistics !== false) && !live) {
-    const res = await provider.get<AfPlayerStatEntry>('/fixtures/players', { fixture: pFixture });
+    const res = await provider.get<AfPlayerStatEntry>('/fixtures/players', { fixture: pFixture, ...quotaParams });
     out.playerStats = await upsertPlayerMatchStatistics(fixtureId, res.data.response as AfPlayerStatEntry[]);
   }
   if (!coverage || coverage.lineups !== false) {
-    const res = await provider.get<AfLineup>('/fixtures/lineups', { fixture: pFixture });
+    const res = await provider.get<AfLineup>('/fixtures/lineups', { fixture: pFixture, ...quotaParams });
     out.lineups = await upsertLineups(fixtureId, res.data.response as AfLineup[]);
   }
   await invalidateFixture(fixtureId);
@@ -165,10 +209,26 @@ export async function fetchFixtureDetails(fixtureId: number): Promise<{ events: 
 /** Live sync: find live fixtures, refresh scores/status/events cheaply. */
 export async function syncLiveFixtures(): Promise<{ live: number; updated: number; finalized: number }> {
   const provider = await getProvider();
+  const pairs = await query<{ provider_id: string; year: number }>(
+    `SELECT DISTINCT c.provider_id, se.year
+       FROM competition_seasons cs
+       JOIN competitions c ON c.id = cs.competition_id
+       JOIN seasons se ON se.id = cs.season_id
+      WHERE cs.import_scope = 'in_scope'
+        AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+        AND se.year = $1`,
+    [config.currentImportSeason],
+  );
+  const inScope = new Set(pairs.map((r) => `${r.provider_id}:${r.year}`));
+  if (inScope.size === 0) return { live: 0, updated: 0, finalized: 0 };
   const res = await provider.get<AfFixture>('/fixtures', { live: 'all' });
+  let live = 0;
   let updated = 0;
   let finalized = 0;
   for (const f of res.data.response) {
+    const key = `${f.league?.id ?? ''}:${f.league?.season ?? ''}`;
+    if (!inScope.has(key)) continue;
+    live += 1;
     const resolved = await resolveFixtureIds(f);
     const up = await upsertFixture(f, resolved);
     if (!up) continue;
@@ -179,11 +239,16 @@ export async function syncLiveFixtures(): Promise<{ live: number; updated: numbe
     }
     if (up.justCompleted) {
       finalized += 1;
-      await enqueueTask({ taskKey: `postmatch:${up.fixtureId}`, taskType: 'fixture:postmatch', params: { fixtureId: up.fixtureId }, priority: 25 });
+      await enqueueTask({
+        taskKey: `postmatch:${up.fixtureId}`,
+        taskType: 'fixture:postmatch',
+        params: { fixtureId: up.fixtureId, quotaClass: 'essential' },
+        priority: 25,
+      });
     }
     await invalidateFixture(up.fixtureId);
   }
-  return { live: res.data.results, updated, finalized };
+  return { live, updated, finalized };
 }
 
 async function fetchFixtureEventsOnly(fixtureId: number, providerFixtureId: number): Promise<void> {
@@ -196,9 +261,15 @@ async function fetchFixtureEventsOnly(fixtureId: number, providerFixtureId: numb
  * Post-match pipeline: final events/statistics/players/lineups → referee/team/
  * player/competition statistics → prediction features → cache → finalize.
  */
-export async function runPostMatchPipeline(fixtureId: number): Promise<{ finalized: boolean; stats: Record<string, unknown> }> {
+export async function runPostMatchPipeline(fixtureId: number, quotaClass?: 'essential' | 'background'): Promise<{ finalized: boolean; stats: Record<string, unknown> }> {
   const fx = await queryOne<{ id: number; status_short: string; finalized: boolean }>(
-    `SELECT id, status_short, finalized FROM fixtures WHERE id = $1`,
+    `SELECT f.id, f.status_short, f.finalized
+       FROM fixtures f
+       JOIN competitions c ON c.id = f.competition_id
+       JOIN seasons se ON se.id = f.season_id
+       JOIN competition_seasons cs ON cs.competition_id = f.competition_id AND cs.season_id = f.season_id
+      WHERE f.id = $1 AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+        AND se.import_scope = 'in_scope' AND cs.import_scope = 'in_scope'`,
     [fixtureId],
   );
   if (!fx) throw new Error(`fixture ${fixtureId} not found`);
@@ -208,7 +279,7 @@ export async function runPostMatchPipeline(fixtureId: number): Promise<{ finaliz
   // (historical completed fixtures stay mostly immutable).
   const needDetails = await fixtureNeedsDetails(fixtureId, COMPLETED_STATUSES.has(fx.status_short as never));
   const details = needDetails
-    ? await fetchFixtureDetails(fixtureId)
+    ? await fetchFixtureDetails(fixtureId, quotaClass)
     : { events: 0, teamStats: 0, playerStats: 0, lineups: 0, reused: true };
   const completed = COMPLETED_STATUSES.has(fx.status_short as never);
 
@@ -238,28 +309,37 @@ export async function runPostMatchPipeline(fixtureId: number): Promise<{ finaliz
  * Upcoming-fixtures sync: ONE request per day (`/fixtures?date=…` returns every
  * league's fixtures for that date) instead of one request per league — a full
  * 7-day window costs 7 requests regardless of how many leagues are in scope.
- * Results are filtered to configured in-scope competition/season pairs;
- * upserts are idempotent and raw payloads are stored as usual.
+ * Results are filtered to approved competition/current-season pairs;
+ * upserts are idempotent and raw payloads are stored as usual. `daysBack`
+ * is reserved for the daily recently-finished reconciliation and is zero for
+ * the normal upcoming task so the provider request count stays predictable.
  */
-export async function syncUpcomingFixtures(daysAhead = 7): Promise<{ fixtures: number; requests: number }> {
+export async function syncUpcomingFixtures(daysAhead = 7, daysBack = 0): Promise<{ fixtures: number; requests: number }> {
   const provider = await getProvider();
   const pairs = await query<{ provider_id: string; year: number }>(
     `SELECT DISTINCT c.provider_id, se.year
        FROM competition_seasons cs
        JOIN competitions c ON c.id = cs.competition_id
        JOIN seasons se ON se.id = cs.season_id
-      WHERE cs.import_scope = 'in_scope'`,
+      WHERE cs.import_scope = 'in_scope'
+        AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+        AND se.year = $1`,
+    [config.currentImportSeason],
   );
   const inScope = new Set(pairs.map((r) => `${r.provider_id}:${r.year}`));
+  if (inScope.size === 0) return { fixtures: 0, requests: 0 };
   let count = 0;
   let requests = 0;
-  for (let d = 0; d < Math.max(1, Math.min(daysAhead, 14)); d++) {
+  const back = Math.min(Math.max(0, daysBack), 7);
+  const ahead = Math.min(Math.max(0, daysAhead), 14);
+  if (back === 0 && ahead === 0) return { fixtures: 0, requests: 0 };
+  for (let d = -back; d < ahead; d++) {
     const date = new Date(Date.now() + d * 864e5).toISOString().slice(0, 10);
     const res = await provider.get<AfFixture>('/fixtures', { date });
     requests += 1;
     for (const f of res.data.response) {
       const key = `${f.league?.id ?? ''}:${f.league?.season ?? ''}`;
-      if (!inScope.has(key)) continue; // stay within the configured import scope
+      if (!inScope.has(key)) continue; // approved competitions, season 2026 only
       const resolved = await resolveFixtureIds(f);
       const up = await upsertFixture(f, resolved);
       if (up) count += 1;
@@ -269,15 +349,25 @@ export async function syncUpcomingFixtures(daysAhead = 7): Promise<{ fixtures: n
 }
 
 /** Finished-but-not-finalized fixtures → post-match tasks. */
-export async function enqueuePostMatchTasks(limit = 50): Promise<{ tasks: number }> {
+export async function enqueuePostMatchTasks(limit = 50, sinceDays = 0): Promise<{ tasks: number }> {
   const rows = await query<{ id: number }>(
-    `SELECT id FROM fixtures
-      WHERE finalized = FALSE AND status_short IN ('FT', 'AET', 'PEN')
-      ORDER BY kickoff_utc DESC NULLS LAST LIMIT $1`,
-    [limit],
+    `SELECT f.id FROM fixtures f
+      JOIN competitions c ON c.id = f.competition_id
+      JOIN seasons se ON se.id = f.season_id
+      WHERE f.finalized = FALSE AND f.status_short IN ('FT', 'AET', 'PEN')
+        AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+        AND se.year = $2
+        AND ($3 = 0 OR f.kickoff_utc >= now() - ($3 || ' days')::interval)
+      ORDER BY f.kickoff_utc DESC NULLS LAST LIMIT $1`,
+    [limit, config.currentImportSeason, Math.min(Math.max(0, sinceDays), 30)],
   );
   for (const r of rows) {
-    await enqueueTask({ taskKey: `postmatch:${r.id}`, taskType: 'fixture:postmatch', params: { fixtureId: r.id }, priority: 25 });
+    await enqueueTask({
+      taskKey: `postmatch:${r.id}`,
+      taskType: 'fixture:postmatch',
+      params: { fixtureId: r.id, quotaClass: 'essential' },
+      priority: 25,
+    });
   }
   return { tasks: rows.length };
 }

@@ -181,7 +181,10 @@
       if (!health) throw new Error();
       const mode = health.providerMode === 'live' ? 'live provider' : 'mock data mode';
       const checks = dataHealth?.summary;
-      const quality = checks ? ` · ${checks.passed}/${checks.passed + checks.failed} quality checks` : '';
+      const totalChecks = checks ? checks.passed + checks.warnings + checks.failed : 0;
+      const quality = checks
+        ? ` · ${checks.passed}/${totalChecks} quality checks${checks.warnings ? ` · ${checks.warnings} warning${checks.warnings === 1 ? '' : 's'}` : ''}`
+        : '';
       dot.className = 'status-dot ok';
       text.textContent = `Data service online · ${mode}${quality}`;
     } catch {

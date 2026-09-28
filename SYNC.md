@@ -35,18 +35,20 @@ to requeue them.
 | 30 | just-completed fixture details |
 | 40–45 | coverage discovery, teams/squads |
 | 55–60 | fixture lists, standings |
-| 70 | historical details |
-| 75–85 | injuries, transfers, odds |
+| 70 | current completed-fixture details |
+| 80–85 | historical details and injuries/transfers/odds |
 | 90–95 | metadata refresh, stat rollups |
 
 ## Initial historical import
 
-`npm run historical:import` enqueues: competitions/seasons → coverage probes →
-teams/squads → fixtures (3 completed previous seasons + current per
-`HISTORICAL_SEASONS_BACK`) → per-fixture details → standings → injuries → odds →
-transfers → full derived-stat rollup. The run drains as much as
-`IMPORT_TASK_BUDGET` (default 500) allows; **re-run to resume** — completed
-work is never redone. Afterwards:
+`npm run historical:import` imports the approved Tier 1–3 catalogue and enqueues
+only the completed historical seasons **2023, 2024, and 2025**. Season 2026 is
+not part of this background queue: live, today, upcoming, and recently finished
+2026 fixtures are handled by the current-priority scheduler. Per-pair
+`historical_imported_at` markers prevent completed historical seasons from
+requesting `/fixtures` again. The run drains as much as `IMPORT_TASK_BUDGET`
+(default 500) allows; **re-run to resume** — completed work is never redone.
+Afterwards:
 
 ```bash
 npx tsx scripts/bulk-finalize.ts    # post-match pipeline for completed fixtures
@@ -62,10 +64,13 @@ Every 30 s the scheduler enqueues idempotent window-scoped tasks:
   (or while any fixture is live): score/status deltas, important events, cache
   invalidation; stops intensive polling when matches finish
 - **upcoming sync** — every `SYNC_UPCOMING_INTERVAL_SECONDS` (900): near-term
-  fixture list refresh
+  fixture list refresh for approved 2026 pairs
+- **recent reconciliation** — once per UTC day: re-reads the previous two days
+  of approved 2026 dates so delayed provider results are stored
 - **post-match scan** — every `SYNC_POSTMATCH_INTERVAL_SECONDS` (300): finished
-  but non-finalized fixtures → `fixture:postmatch`
-- **metadata refresh** — every `SYNC_METADATA_INTERVAL_SECONDS` (21600)
+  but non-finalized approved 2026 fixtures → `fixture:postmatch`
+- **metadata refresh** — every `SYNC_METADATA_INTERVAL_SECONDS` (21600):
+  re-audits the allowlist and queues any unfinished 2023–2025 pair
 - **stat rollup** — hourly (delayed 5 min)
 
 ## Post-match pipeline (spec §31)
@@ -100,7 +105,8 @@ background floor 30 000):
   metadata refresh — is DEFERRED with exponential backoff (5 → 10 → 20 → 40 →
   60 min cap + jitter; deferrals never burn failure attempts). ESSENTIAL
   traffic keeps running: `live:sync`, `upcoming:sync`, `current:sync`,
-  `postmatch:scan`, `fixture:postmatch`, `fixture:details`.
+  `postmatch:scan`, `fixture:postmatch`, and current-season `fixture:details`.
+  Historical detail/post-match tasks explicitly use the background class.
   Example: 29 355/150 000 remaining (19.6 %) is CAUTION — live + upcoming
   fixture sync continues, background imports wait for the daily reset.
 - **CRITICAL** (remaining ≤ essential reserve): only essential sync continues —

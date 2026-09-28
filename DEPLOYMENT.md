@@ -135,7 +135,8 @@ internal URL.
 | `PROVIDER_ESSENTIAL_RESERVE` | no | 0 = auto (~7% of quota, cap 10 000) — kept for live/upcoming sync |
 | `PROVIDER_BACKGROUND_FLOOR_PERCENT` | no | 20 — background imports pause at/below this % remaining |
 | `PROVIDER_MINUTE_LIMIT` | no | 300 |
-| `HISTORICAL_SEASONS_BACK` | no | 3 |
+| `IMPORT_SEASONS` | no | exactly `2023,2024,2025,2026`; other values are rejected |
+| `HISTORICAL_SEASONS_BACK` | no | legacy compatibility only; fixed importer scope is `IMPORT_SEASONS` |
 | `SYNC_LIVE_INTERVAL_SECONDS` | no | 60 |
 | `SYNC_UPCOMING_INTERVAL_SECONDS` | no | 900 |
 | `SYNC_POSTMATCH_INTERVAL_SECONDS` | no | 300 |

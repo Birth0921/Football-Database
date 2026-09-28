@@ -32,11 +32,19 @@ export async function enqueueTask(input: EnqueueTaskInput): Promise<number> {
     `INSERT INTO sync_tasks (job_id, task_key, task_type, params, priority, scheduled_for, max_attempts, status)
      VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
      ON CONFLICT (task_key) DO UPDATE SET
-       scheduled_for = CASE WHEN sync_tasks.status IN ('done') THEN sync_tasks.scheduled_for ELSE EXCLUDED.scheduled_for END,
-       status = CASE WHEN sync_tasks.status IN ('done') THEN sync_tasks.status ELSE 'pending' END,
-       attempts = CASE WHEN sync_tasks.status IN ('done') THEN sync_tasks.attempts ELSE 0 END,
-       params = EXCLUDED.params,
-       priority = EXCLUDED.priority,
+       -- A running task must not be reset by an overlapping scheduler cycle;
+       -- done tasks are immutable, while failed/pending tasks may be resumed.
+       scheduled_for = CASE
+         WHEN sync_tasks.status IN ('done', 'running') OR sync_tasks.scheduled_for > now() THEN sync_tasks.scheduled_for
+         ELSE EXCLUDED.scheduled_for
+       END,
+       status = CASE WHEN sync_tasks.status IN ('done', 'running') THEN sync_tasks.status ELSE 'pending' END,
+       attempts = CASE
+         WHEN sync_tasks.status IN ('done', 'running') OR sync_tasks.scheduled_for > now() THEN sync_tasks.attempts
+         ELSE 0
+       END,
+       params = CASE WHEN sync_tasks.status IN ('done', 'running') THEN sync_tasks.params ELSE EXCLUDED.params END,
+       priority = CASE WHEN sync_tasks.status IN ('done', 'running') THEN sync_tasks.priority ELSE EXCLUDED.priority END,
        updated_at = now()
      RETURNING id`,
     [

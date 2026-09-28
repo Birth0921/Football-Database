@@ -1,5 +1,13 @@
 # IMPLEMENTATION REPORT — Autonomous Football Data Platform
 
+> **Scope update — 2026-09-28:** The importer now uses the strict production
+> window `IMPORT_SEASONS=2023,2024,2025,2026`. The historical queue is limited
+> to 2023–2025 and marks completed competition-season pairs with
+> `historical_imported_at`; 2026 live/today/upcoming/recently-finished syncs
+> remain current-priority. The older baseline totals and dynamic-window notes
+> below describe the earlier implementation and are superseded by this scope
+> update.
+
 Date: 2026-09-24 · Branch: `arena/01a0d445-football-database` ·
 Spec: `Soccer.md` (AUTONOMOUS FOOTBALL DATA PLATFORM)
 

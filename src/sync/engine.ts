@@ -14,7 +14,7 @@ function bullConnection() {
 }
 import type { SyncTaskRow } from '../types.js';
 import { claimDueTasks, claimTaskById, deferTaskForQuota, markTaskDone, markTaskFailed, requeueStuckTasks } from './tasks.js';
-import { quotaManager, taskClassFor } from './quota.js';
+import { quotaManager } from './quota.js';
 
 export type TaskHandler = (params: Record<string, unknown>, task: SyncTaskRow) => Promise<unknown>;
 
@@ -38,18 +38,23 @@ export async function processTask(task: SyncTaskRow): Promise<boolean> {
   const t0 = Date.now();
   (globalThis as { __syncTaskKey?: string }).__syncTaskKey = task.task_key;
   (globalThis as { __syncTaskType?: string }).__syncTaskType = task.task_type;
+  const requestedClass = task.params?.quotaClass;
+  const taskClass = requestedClass === 'essential' || requestedClass === 'background'
+    ? requestedClass
+    : task.task_type;
   try {
     if (!handler) {
       throw new Error(`No handler registered for task type '${task.task_type}'`);
     }
     // Quota policy gate: essential (live/upcoming) sync keeps running while
     // quota is low; background work is deferred with exponential backoff and
-    // never burns failure attempts.
-    const gate = await quotaManager.allows(task.task_type);
+    // never burns failure attempts. A task may explicitly downgrade a shared
+    // handler, e.g. historical fixture details.
+    const gate = await quotaManager.allows(taskClass);
     if (!gate.allowed) {
       const delay = quotaManager.deferDelaySeconds(Number(task.quota_defers ?? 0));
       await deferTaskForQuota(task.id, delay, `deferred: provider quota ${gate.state} (${gate.dailyRemaining} requests remaining)`);
-      log.info({ state: gate.state, class: taskClassFor(task.task_type), remaining: gate.dailyRemaining, deferredSeconds: delay }, 'task deferred for provider quota (rescheduled with backoff)');
+      log.info({ state: gate.state, class: gate.class, remaining: gate.dailyRemaining, deferredSeconds: delay }, 'task deferred for provider quota (rescheduled with backoff)');
       return true;
     }
     const summary = await handler(task.params ?? {}, task);

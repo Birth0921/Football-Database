@@ -36,7 +36,7 @@ npm run dev:web          # website + admin :8080
 
 # 7) initial data import (resumable, quota-aware)
 npm run competitions:import
-npm run historical:import     # 3 previous seasons + current; re-run to resume
+npm run historical:import     # one-time 2023–2025 background import; re-run to resume
 npx tsx scripts/bulk-finalize.ts   # post-match finalization backfill
 npm run statistics:recalculate
 npm run data-quality:check
@@ -139,6 +139,7 @@ See [.env.example](.env.example) for the full annotated list:
 - `API_FOOTBALL_KEY` — external provider key (backend-only; empty = mock mode)
 - `JWT_SECRET`, `ADMIN_USER`, `ADMIN_PASSWORD` — admin dashboard auth
 - `PROVIDER_DAILY_QUOTA` (75 000), `PROVIDER_MINUTE_LIMIT` (300) — quota plan
-- `HISTORICAL_SEASONS_BACK` (3), `SYNC_*_INTERVAL_SECONDS` — sync cadences
+- `IMPORT_SEASONS=2023,2024,2025,2026` — strict importer window (other seasons are rejected)
+- `SYNC_*_INTERVAL_SECONDS` — live/upcoming/post-match/metadata cadences; `HISTORICAL_SEASONS_BACK` is retained only for backwards-compatible configuration
 
 **Never commit `.env`. Never expose `API_FOOTBALL_KEY` to any frontend.**

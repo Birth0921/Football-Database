@@ -282,23 +282,24 @@ describe('CLI orchestration', () => {
 });
 
 describe('competitions import (optimized, batched)', () => {
-  it('imports ALL provider leagues and pairs every competition with every known season', async () => {
+  it('imports only approved provider leagues and pairs them with the fixed season window', async () => {
     // every league the provider returned exists exactly once
     const comps = await query<{ provider_id: string; n: number }>(
       `SELECT provider_id, count(*)::int AS n FROM competitions GROUP BY provider_id`,
     );
     const byId = new Map(comps.map((c) => [c.provider_id, c.n]));
     for (const pid of ['39', '140', '40', '758']) {
-      expect(byId.get(pid)).toBe(1); // all provider leagues imported, no duplicates
+      expect(byId.get(pid)).toBe(1); // approved mock leagues, no duplicates
     }
-    // every competition × every season year is linked (4 comps × 5 years)
+    // every approved competition × every configured season is linked (4 × 4)
     const links = await query<{ c: number }>(
       `SELECT count(*)::int AS c FROM competition_seasons cs
         JOIN competitions co ON co.id = cs.competition_id
         JOIN seasons se ON se.id = cs.season_id
-       WHERE se.year BETWEEN 2022 AND 2026`,
+       WHERE se.year = ANY($1::int[])`,
+      [[2023, 2024, 2025, 2026]],
     );
-    expect(links[0].c).toBe(20);
+    expect(links[0].c).toBe(16);
   });
 
   it('preserves is_current and historical import scope', async () => {
@@ -312,7 +313,8 @@ describe('competitions import (optimized, batched)', () => {
         JOIN seasons se ON se.id = cs.season_id ORDER BY se.year`,
     );
     const byYear = new Map(scopeRows.map((r) => [r.year, r.scope]));
-    expect(byYear.get(2022)).toBe('out_of_scope');
+    expect(byYear.has(2022)).toBe(false); // rejected, not merely linked as out of scope
+    expect(byYear.size).toBe(4);
     for (const y of [2023, 2024, 2025, 2026]) expect(byYear.get(y)).toBe('in_scope');
   });
 

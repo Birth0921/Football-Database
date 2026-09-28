@@ -28,7 +28,14 @@ export function registerAllHandlers(): void {
     discoverCoverage(Number(p.competitionId), Number(p.seasonId)));
   registerHandler('teams:import', async (p) =>
     importTeamsAndSquads(Number(p.competitionId), Number(p.seasonId)));
-  registerHandler('season-window:enqueue', async () => enqueueSeasonWindowTasks());
+  registerHandler('season-window:enqueue', async () => {
+    // Refresh and audit the provider catalogue before re-enqueuing historical
+    // work. This keeps the allowlist cleanup automatic after restarts and
+    // catches provider ID aliases without touching shared entities.
+    const meta = await importCompetitions();
+    const enqueued = await enqueueSeasonWindowTasks();
+    return { meta, enqueued };
+  });
 
   // ---- fixtures -----------------------------------------------------------
   registerHandler('fixtures:import', async (p, task) => {
@@ -51,11 +58,19 @@ export function registerAllHandlers(): void {
     }
     return { ...res, chainedFollowUps: res.imported > 0 };
   });
-  registerHandler('fixture:details', async (p) => fetchFixtureDetails(Number(p.fixtureId)));
-  registerHandler('fixture:postmatch', async (p) => runPostMatchPipeline(Number(p.fixtureId)));
+  registerHandler('fixture:details', async (p) => {
+    const quotaClass = p.quotaClass === 'essential' || p.quotaClass === 'background' ? p.quotaClass : undefined;
+    return fetchFixtureDetails(Number(p.fixtureId), quotaClass);
+  });
+  registerHandler('fixture:postmatch', async (p) => {
+    const quotaClass = p.quotaClass === 'essential' || p.quotaClass === 'background' ? p.quotaClass : undefined;
+    return runPostMatchPipeline(Number(p.fixtureId), quotaClass);
+  });
   registerHandler('live:sync', async () => syncLiveFixtures());
-  registerHandler('upcoming:sync', async (p) => syncUpcomingFixtures(Number(p.daysAhead ?? 7)));
-  registerHandler('postmatch:scan', async (p) => enqueuePostMatchTasks(Number(p.limit ?? 50)));
+  registerHandler('upcoming:sync', async (p) =>
+    syncUpcomingFixtures(Number(p.daysAhead ?? 7), Number(p.daysBack ?? 0)));
+  registerHandler('postmatch:scan', async (p) =>
+    enqueuePostMatchTasks(Number(p.limit ?? 50), Number(p.sinceDays ?? 0)));
 
   // ---- supporting data ----------------------------------------------------
   registerHandler('standings:sync', async (p) => syncStandings(Number(p.competitionId), Number(p.seasonId)));
@@ -121,10 +136,11 @@ export function registerAllHandlers(): void {
     );
     if ((scope?.c ?? 0) === 0) await importCompetitions();
 
-    // high-priority current-season refresh cycle
-    await syncUpcomingFixtures(7);
+    // High-priority current-season refresh: today + next seven days, plus a
+    // short recent window so finished matches are reconciled every run.
+    await syncUpcomingFixtures(7, 0);
     const live = await syncLiveFixtures();
-    await enqueuePostMatchTasks(50);
+    await enqueuePostMatchTasks(100, 3);
     return { live };
   });
 }
