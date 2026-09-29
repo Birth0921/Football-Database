@@ -24,7 +24,10 @@ function per(a: number, m: number): number {
 }
 
 /** Per-fixture referee record (call after match completion). */
-export async function recalculateRefereeForFixture(fixtureId: number): Promise<{ refereeId: number | null; rows: number }> {
+export async function recalculateRefereeForFixture(
+  fixtureId: number,
+  opts: { recalculateAggregates?: boolean } = {},
+): Promise<{ refereeId: number | null; rows: number }> {
   const fx = await queryOne<{
     id: number; referee_id: number | null; competition_id: number | null; season_id: number | null;
     home_team_id: number | null; status_short: string;
@@ -88,7 +91,7 @@ export async function recalculateRefereeForFixture(fixtureId: number): Promise<{
     [fx.referee_id, fixtureId, second, red, fouls?.total ?? null, penalties],
   );
 
-  if (fx.season_id && fx.competition_id) {
+  if (opts.recalculateAggregates !== false && fx.season_id && fx.competition_id) {
     await recalculateRefereeSeason(fx.referee_id, fx.season_id, fx.competition_id);
     await recalculateRefereeCompetition(fx.referee_id, fx.competition_id);
   }
@@ -208,25 +211,50 @@ export async function recalculateRefereeCompetition(refereeId: number, competiti
 }
 
 export async function recalculateAllReferees(): Promise<{ referees: number }> {
-  const rows = await query<{ referee_id: number }>(
-    `SELECT DISTINCT referee_id FROM referee_match_statistics WHERE referee_id IS NOT NULL`,
+  // Bootstrap match-level analytics from completed fixtures, not from the
+  // derived table itself. On a fresh/historical import referee_match_statistics
+  // is empty, so using it as the seed makes the rebuild a permanent no-op.
+  //
+  // Bulk backfills only use fixtures with both event and team-stat detail:
+  // cards come from fixture_events and fouls from fixture_team_statistics.
+  // This avoids treating missing historical detail as genuine zero values.
+  const fixtures = await query<{ id: number; referee_id: number }>(
+    `SELECT f.id, f.referee_id
+       FROM fixtures f
+      WHERE f.referee_id IS NOT NULL
+        AND f.status_short IN ('FT','AET','PEN')
+        AND EXISTS (SELECT 1 FROM fixture_events e WHERE e.fixture_id = f.id)
+        AND EXISTS (SELECT 1 FROM fixture_team_statistics s WHERE s.fixture_id = f.id)
+      ORDER BY f.kickoff_utc ASC`,
   );
-  for (const r of rows) {
+
+  const refereeIds = new Set<number>();
+  for (const fixture of fixtures) {
+    await recalculateRefereeForFixture(fixture.id, { recalculateAggregates: false });
+    refereeIds.add(Number(fixture.referee_id));
+  }
+
+  // Match rows now exist; aggregate each referee/scope exactly once instead of
+  // repeating the same season/competition scans after every fixture.
+  for (const refereeId of refereeIds) {
     const pairs = await query<{ season_id: number; competition_id: number }>(
       `SELECT DISTINCT f.season_id, f.competition_id
-         FROM referee_match_statistics rms JOIN fixtures f ON f.id = rms.fixture_id
-        WHERE rms.referee_id = $1 AND f.season_id IS NOT NULL AND f.competition_id IS NOT NULL`,
-      [r.referee_id],
+         FROM referee_match_statistics rms
+         JOIN fixtures f ON f.id = rms.fixture_id
+        WHERE rms.referee_id = $1
+          AND f.season_id IS NOT NULL
+          AND f.competition_id IS NOT NULL`,
+      [refereeId],
     );
-    for (const p of pairs) {
-      await recalculateRefereeSeason(r.referee_id, p.season_id, p.competition_id);
+    for (const pair of pairs) {
+      await recalculateRefereeSeason(refereeId, pair.season_id, pair.competition_id);
     }
-    const comps = await query<{ competition_id: number }>(
-      `SELECT DISTINCT f.competition_id FROM referee_match_statistics rms JOIN fixtures f ON f.id = rms.fixture_id
-        WHERE rms.referee_id = $1 AND f.competition_id IS NOT NULL`,
-      [r.referee_id],
-    );
-    for (const c of comps) await recalculateRefereeCompetition(r.referee_id, c.competition_id);
+
+    const competitions = new Set(pairs.map((pair) => Number(pair.competition_id)));
+    for (const competitionId of competitions) {
+      await recalculateRefereeCompetition(refereeId, competitionId);
+    }
   }
-  return { referees: rows.length };
+
+  return { referees: refereeIds.size };
 }
