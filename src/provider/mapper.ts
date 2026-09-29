@@ -260,12 +260,46 @@ export async function upsertFixture(f: AfFixture, ids: {
   return { fixtureId, changed, completed, justCompleted };
 }
 
+const REFEREE_COUNTRIES = new Set([
+  'Algeria', 'Argentina', 'Austria', 'Belgium', 'Benin',
+  'Bolivia', 'Bosnia & Herzegovina', 'Brazil', 'Bulgaria', 'Burundi',
+  'Cameroon', 'Chad', 'Chile', 'Colombia', 'Congo Republic',
+  "Côte d'Ivoire", 'Croatia', 'DR Congo', 'Ecuador', 'Egypt',
+  'France', 'Gabon', 'Germany', 'Ghana', 'Greece', 'Hungary',
+  'Kenya', 'Lithuania', 'Mali', 'Mauritania', 'Mauritius',
+  'Montenegro', 'Morocco', 'Netherlands', 'Peru', 'Poland',
+  'Romania', 'Russia', 'Rwanda', 'Saudi Arabia', 'Scotland',
+  'Senegal', 'Slovenia', 'Somalia', 'South Africa', 'Spain',
+  'Sudan', 'Sweden', 'Switzerland', 'Tunisia', 'Uganda',
+  'Uruguay', 'Venezuela',
+]);
+
+function refereeNationalityFromFixtureName(name: string): string | null {
+  const parts = name.split(',').map((part) => part.trim()).filter(Boolean);
+  if (parts.length < 2) return null;
+  const suffix = parts[parts.length - 1];
+  return REFEREE_COUNTRIES.has(suffix) ? suffix : null;
+}
+
 export async function resolveRefereeByName(name: string | null): Promise<number | null> {
   const t = s(name);
   if (!t) return null;
-  const existing = await queryOne<{ id: number }>(`SELECT id FROM referees WHERE lower(name) = lower($1) LIMIT 1`, [t]);
-  if (existing) return existing.id;
-  return upsertReferee({ id: null, name: t });
+  const nationality = refereeNationalityFromFixtureName(t);
+  const existing = await queryOne<{ id: number; nationality: string | null }>(
+    `SELECT id, nationality FROM referees WHERE lower(name) = lower($1) LIMIT 1`,
+    [t],
+  );
+  if (existing) {
+    if (!existing.nationality && nationality) {
+      await query(
+        `UPDATE referees SET nationality = $2, updated_at = now()
+          WHERE id = $1 AND nationality IS NULL`,
+        [existing.id, nationality],
+      );
+    }
+    return existing.id;
+  }
+  return upsertReferee({ id: null, name: t, country: nationality });
 }
 
 export async function replaceFixtureEvents(fixtureId: number, events: AfEvent[]): Promise<number> {
