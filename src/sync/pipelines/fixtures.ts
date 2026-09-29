@@ -232,21 +232,50 @@ export async function syncLiveFixtures(): Promise<{ live: number; updated: numbe
   );
   const inScope = new Set(pairs.map((r) => `${r.provider_id}:${r.year}`));
   if (inScope.size === 0) return { live: 0, updated: 0, finalized: 0 };
+
+  // Snapshot fixtures we currently believe are live. A fixture disappears from
+  // /fixtures?live=all as soon as the provider marks it FT/AET/PEN (or otherwise
+  // leaves the live set), so without an exact-ID reconciliation its last local
+  // state can remain stuck forever at e.g. 2H 90'.
+  const locallyLive = await query<{ id: number; provider_fixture_id: string }>(
+    `SELECT f.id, f.provider_fixture_id
+       FROM fixtures f
+       JOIN competitions c ON c.id = f.competition_id
+       JOIN seasons se ON se.id = f.season_id
+       JOIN competition_seasons cs
+         ON cs.competition_id = f.competition_id AND cs.season_id = f.season_id
+      WHERE f.status_short IN ('1H','HT','2H','ET','BT','P','INT')
+        AND c.active = TRUE AND c.import_tier BETWEEN 1 AND 3
+        AND se.year = ANY($1::int[])
+        AND se.import_scope = 'in_scope'
+        AND cs.import_scope = 'in_scope'`,
+    [config.importSeasons],
+  );
+
   const res = await provider.get<AfFixture>('/fixtures', { live: 'all' });
+  const providerLiveIds = new Set(
+    res.data.response
+      .filter((f) => inScope.has(`${f.league?.id ?? ''}:${f.league?.season ?? ''}`))
+      .flatMap((f) => f.id != null ? [String(f.id)] : []),
+  );
+
   let live = 0;
   let updated = 0;
   let finalized = 0;
-  for (const f of res.data.response) {
+
+  const processFixture = async (f: AfFixture, refreshLiveEvents: boolean): Promise<void> => {
     const key = `${f.league?.id ?? ''}:${f.league?.season ?? ''}`;
-    if (!inScope.has(key)) continue;
-    live += 1;
+    if (!inScope.has(key)) return;
+
     const resolved = await resolveFixtureIds(f);
     const up = await upsertFixture(f, resolved);
-    if (!up) continue;
+    if (!up) return;
+
     if (up.changed) {
       updated += 1;
-      // important events refresh while live
-      await fetchFixtureEventsOnly(up.fixtureId, f.id);
+      if (refreshLiveEvents && f.id != null) {
+        await fetchFixtureEventsOnly(up.fixtureId, f.id);
+      }
     }
     if (up.justCompleted) {
       finalized += 1;
@@ -258,7 +287,27 @@ export async function syncLiveFixtures(): Promise<{ live: number; updated: numbe
       });
     }
     await invalidateFixture(up.fixtureId);
+  };
+
+  for (const f of res.data.response) {
+    const key = `${f.league?.id ?? ''}:${f.league?.season ?? ''}`;
+    if (!inScope.has(key)) continue;
+    live += 1;
+    await processFixture(f, true);
   }
+
+  // Reconcile fixtures that were locally live but vanished from live=all.
+  // Fetching by exact provider ID captures the terminal status instead of
+  // guessing why the fixture left the live feed.
+  for (const local of locallyLive) {
+    if (providerLiveIds.has(String(local.provider_fixture_id))) continue;
+    const current = await provider.get<AfFixture>('/fixtures', {
+      id: String(local.provider_fixture_id),
+    });
+    const fixture = current.data.response[0];
+    if (fixture) await processFixture(fixture, false);
+  }
+
   return { live, updated, finalized };
 }
 
