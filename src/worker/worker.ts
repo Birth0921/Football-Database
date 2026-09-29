@@ -1,28 +1,42 @@
 /**
- * Background worker: BullMQ sync worker + periodic DB-task dispatcher.
- * Restart-safe: all state lives in sync_tasks / sync_jobs (PostgreSQL).
+ * Background worker: periodic PostgreSQL task dispatcher.
+ * Restart-safe: all task state lives in sync_tasks / sync_jobs.
+ * Redis is used by the application as a cache, not as the task transport.
  */
 import { registerAllHandlers } from '../sync/handlers.js';
-import { startWorker, stopWorker, dispatchDueTasks, getSyncQueue } from '../sync/engine.js';
+import { dispatchDueTasks } from '../sync/engine.js';
 import { logger } from '../lib/logger.js';
 import { config, ensureSecretsForProduction } from '../config.js';
 
 async function main(): Promise<void> {
   ensureSecretsForProduction();
   registerAllHandlers();
-  await startWorker(2);
+  let sweeping = false;
 
-  // periodic sweep: picks up queued tasks (also after crashes / grace re-dispatch)
-  const sweep = setInterval(() => {
-    void dispatchDueTasks(10).catch((err) => logger.warn({ err: (err as Error).message }, 'dispatch sweep failed'));
+  const sweep = async (limit: number): Promise<void> => {
+    if (sweeping) return;
+    sweeping = true;
+    try {
+      await dispatchDueTasks(limit);
+    } catch (err) {
+      logger.warn({ err: (err as Error).message }, 'dispatch sweep failed');
+    } finally {
+      sweeping = false;
+    }
+  };
+
+  // The worker owns execution. Claims are atomic in PostgreSQL and tasks are
+  // processed with bounded concurrency to keep memory/CPU/provider pressure
+  // predictable on the 1-vCPU VPS.
+  void sweep(20);
+  const sweepTimer = setInterval(() => {
+    void sweep(10);
   }, config.workerSweepIntervalSeconds * 1000);
-  void dispatchDueTasks(50);
 
   logger.info({ providerMode: config.providerMode }, 'worker ready');
 
   const shutdown = async () => {
-    clearInterval(sweep);
-    await stopWorker();
+    clearInterval(sweepTimer);
     process.exit(0);
   };
   process.on('SIGINT', () => void shutdown());
@@ -33,5 +47,3 @@ main().catch((err) => {
   logger.error({ err }, 'worker failed to start');
   process.exit(1);
 });
-
-export { getSyncQueue };

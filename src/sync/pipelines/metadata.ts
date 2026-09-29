@@ -367,7 +367,7 @@ export async function discoverCoverage(competitionId: number, seasonId: number):
     lineups: true,
     fixture_statistics: true,
     player_statistics: players,
-    standings,
+    standings: true,
     players,
     top_scorers: players,
     top_assists: players,

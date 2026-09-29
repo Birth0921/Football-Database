@@ -121,42 +121,46 @@ export async function claimTaskById(id: number): Promise<SyncTaskRow | null> {
   return rows[0] ?? null;
 }
 
-export async function markTaskDone(id: number, summary: unknown, durationMs: number): Promise<void> {
+export async function markTaskDone(id: number, attempt: number, summary: unknown, durationMs: number): Promise<void> {
   await query(
     `UPDATE sync_tasks
-        SET status = 'done', completed_at = now(), duration_ms = $2, result_summary = $3, last_error = NULL, updated_at = now()
-      WHERE id = $1`,
-    [id, durationMs, JSON.stringify(summary ?? {})],
+        SET status = 'done', completed_at = now(), duration_ms = $3, result_summary = $4, last_error = NULL, updated_at = now()
+      WHERE id = $1 AND status = 'running' AND attempts = $2`,
+    [id, attempt, durationMs, JSON.stringify(summary ?? {})],
   );
 }
 
-export async function markTaskFailed(id: number, error: Error, durationMs: number): Promise<SyncTaskRow> {
+export async function markTaskFailed(id: number, attempt: number, error: Error, durationMs: number): Promise<SyncTaskRow | null> {
   const rows = await query<SyncTaskRow>(
     `UPDATE sync_tasks
         SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END,
-            last_error = $2,
-            error_info = $3,
-            duration_ms = $4,
+            last_error = $3,
+            error_info = $4,
+            duration_ms = $5,
             scheduled_for = now() + (interval '5 seconds' * power(3, LEAST(attempts, 6))),
             updated_at = now()
       WHERE id = $1
+        AND status = 'running'
+        AND attempts = $2
       RETURNING *`,
-    [id, String(error.message).slice(0, 1000), JSON.stringify({ name: error.name, stack: String(error.stack ?? '').slice(0, 2000) }), durationMs],
+    [id, attempt, String(error.message).slice(0, 1000), JSON.stringify({ name: error.name, stack: String(error.stack ?? '').slice(0, 2000) }), durationMs],
   );
-  return rows[0]!;
+  return rows[0] ?? null;
 }
 
 /** Permanently skip a task (missing/out-of-scope target): never retried. */
-export async function markTaskSkipped(id: number, reason: string, durationMs: number): Promise<SyncTaskRow | null> {
+export async function markTaskSkipped(id: number, attempt: number, reason: string, durationMs: number): Promise<SyncTaskRow | null> {
   const rows = await query<SyncTaskRow>(
     `UPDATE sync_tasks
-        SET status = 'skipped', completed_at = now(), duration_ms = $3,
-            last_error = $2,
-            result_summary = jsonb_build_object('skipped', true, 'reason', $2::text),
+        SET status = 'skipped', completed_at = now(), duration_ms = $4,
+            last_error = $3,
+            result_summary = jsonb_build_object('skipped', true, 'reason', $3::text),
             updated_at = now()
       WHERE id = $1
+        AND status = 'running'
+        AND attempts = $2
       RETURNING *`,
-    [id, reason.slice(0, 1000), durationMs],
+    [id, attempt, reason.slice(0, 1000), durationMs],
   );
   return rows[0] ?? null;
 }
@@ -183,17 +187,19 @@ export async function retryFailedTasks(taskKeys?: string[]): Promise<number> {
  * future scheduled_for (exponential backoff), the claim's attempt increment
  * is rolled back so quota deferrals NEVER burn failure retries.
  */
-export async function deferTaskForQuota(id: number, delaySeconds: number, reason: string): Promise<void> {
+export async function deferTaskForQuota(id: number, attempt: number, delaySeconds: number, reason: string): Promise<void> {
   await query(
     `UPDATE sync_tasks
         SET status = 'pending',
             attempts = GREATEST(attempts - 1, 0),
             quota_defers = coalesce(quota_defers, 0) + 1,
-            scheduled_for = now() + ($2 || ' seconds')::interval,
-            last_error = $3,
+            scheduled_for = now() + ($3 || ' seconds')::interval,
+            last_error = $4,
             updated_at = now()
-      WHERE id = $1`,
-    [id, String(Math.max(1, Math.round(delaySeconds))), reason.slice(0, 500)],
+      WHERE id = $1
+        AND status = 'running'
+        AND attempts = $2`,
+    [id, attempt, String(Math.max(1, Math.round(delaySeconds))), reason.slice(0, 500)],
   );
 }
 

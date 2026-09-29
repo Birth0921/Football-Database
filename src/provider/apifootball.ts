@@ -3,6 +3,7 @@ import { logger } from '../lib/logger.js';
 import { query } from '../lib/db.js';
 import { paramStringHash, safeParams } from '../lib/hash.js';
 import { quotaManager, taskClassFor, type TaskClass } from '../sync/quota.js';
+import { getTaskContext } from '../sync/task-context.js';
 import { AppError, ProviderRequestResult, ProviderResponse } from '../types.js';
 import type { FootballProvider } from './client.js';
 import { storeRawPayload } from './rawstore.js';
@@ -11,6 +12,30 @@ const RETRY_STATUS = new Set([429, 500, 502, 503, 504]);
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * API-Football returns /fixtures rows with fixture-specific fields nested
+ * under `fixture`. The application mapper intentionally uses a flattened
+ * AfFixture shape, so normalize at the provider boundary.
+ *
+ * The original response object is never mutated; raw storage continues to
+ * receive the exact provider payload.
+ */
+function normalizeFixtureResponse<T>(body: ProviderResponse<T>): ProviderResponse<T> {
+  if (!Array.isArray(body.response)) return body;
+
+  const response = body.response.map((item) => {
+    const row = item as T & { fixture?: Record<string, unknown> };
+    if (!row || typeof row !== 'object' || !row.fixture) return item;
+
+    return {
+      ...row.fixture,
+      ...row,
+    } as T;
+  });
+
+  return { ...body, response };
 }
 
 /**
@@ -60,10 +85,11 @@ export class ApiFootballClient implements FootballProvider {
       // Class-aware policy: essential (live/upcoming fixture) sync keeps
       // running while quota is low; background traffic waits for NORMAL.
       const explicit = (params as { quotaClass?: string }).quotaClass;
+      const taskContext = getTaskContext();
       const cls: TaskClass =
         explicit === 'essential' || explicit === 'background'
           ? explicit
-          : taskClassFor((globalThis as { __syncTaskType?: string }).__syncTaskType);
+          : taskClassFor(taskContext?.taskType);
       if (cls === 'background' && st.state !== 'NORMAL') {
         throw new AppError(
           `Provider quota ${st.state.toLowerCase()} — background traffic deferred (${st.dailyRemaining} of ${st.dailyLimit} requests remaining)`,
@@ -126,6 +152,9 @@ export class ApiFootballClient implements FootballProvider {
         }
 
         const ok = httpStatus === 200;
+        const normalizedBody = endpoint === '/fixtures'
+          ? normalizeFixtureResponse(body)
+          : body;
         if (ok) {
           if (endpoint === '/status') {
             // management endpoint: does not consume quota; its counters are
@@ -155,10 +184,22 @@ export class ApiFootballClient implements FootballProvider {
             throw new AppError('Provider authentication failed — check API_FOOTBALL_KEY', 502, 'PROVIDER_AUTH');
           }
           if (httpStatus === 404) {
-            return { data: body, httpStatus, fromCache: false, dailyRemaining, minuteRemaining };
+            return {
+          data: endpoint === '/fixtures' ? normalizedBody : body,
+          httpStatus,
+          fromCache: false,
+          dailyRemaining,
+          minuteRemaining,
+        };
           }
         }
-        return { data: body, httpStatus, fromCache: false, dailyRemaining, minuteRemaining };
+        return {
+          data: endpoint === '/fixtures' ? normalizedBody : body,
+          httpStatus,
+          fromCache: false,
+          dailyRemaining,
+          minuteRemaining,
+        };
       } catch (err) {
         lastError = err;
         if (err instanceof AppError) throw err;
@@ -195,7 +236,7 @@ export class ApiFootballClient implements FootballProvider {
         success,
         dailyRemaining,
         minuteRemaining,
-        (globalThis as { __syncTaskKey?: string }).__syncTaskKey ?? null,
+        getTaskContext()?.taskKey ?? null,
         error ? error.slice(0, 500) : null,
       ],
     );

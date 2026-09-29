@@ -10,6 +10,7 @@
  * coverage (cup competitions without standings/players, one season without player
  * stats, one league without odds) so coverage-gating is exercised.
  */
+import { getTaskContext } from '../sync/task-context.js';
 import { ProviderRequestResult, ProviderResponse } from '../types.js';
 import type { FootballProvider } from './client.js';
 import { storeRawPayload } from './rawstore.js';
@@ -599,7 +600,7 @@ export class MockFootballProvider implements FootballProvider {
                (SELECT daily_remaining FROM provider_quota WHERE provider='api-football' AND day=(now() AT TIME ZONE 'utc')::date),
                (SELECT minute_remaining FROM provider_quota WHERE provider='api-football' AND day=(now() AT TIME ZONE 'utc')::date),
                $4, null)`,
-      [endpoint, paramStringHash(params), Number(Date.now() - t0), (globalThis as { __syncTaskKey?: string }).__syncTaskKey ?? null],
+      [endpoint, paramStringHash(params), Number(Date.now() - t0), getTaskContext()?.taskKey ?? null],
     );
     return { data: body, httpStatus: 200, fromCache: false, dailyRemaining: null, minuteRemaining: null };
   }

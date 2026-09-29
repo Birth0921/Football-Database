@@ -3,12 +3,11 @@
  * - live matches: fast polling only when matches are in play
  * - upcoming fixtures / post-match scan: moderate cadence
  * - metadata / injuries / transfers: slow cadence
- * Uses DB task keys (idempotent) + BullMQ dispatch; cron-like via setInterval
+ * Uses DB task keys (idempotent); cron-like via setInterval.
  * with run-once-per-window guards.
  */
 import { registerAllHandlers } from '../sync/handlers.js';
 import { enqueueTask, upsertJob } from '../sync/tasks.js';
-import { dispatchDueTasks, getSyncQueue, startWorker, stopWorker } from '../sync/engine.js';
 import { logger } from '../lib/logger.js';
 import { config, ensureSecretsForProduction } from '../config.js';
 import { queryOne } from '../lib/db.js';
@@ -89,7 +88,6 @@ async function scheduleCycle(): Promise<void> {
       });
       logger.info('current data bootstrap queued');
     }
-    await dispatchDueTasks(30);
     return;
   }
 
@@ -160,17 +158,11 @@ async function scheduleCycle(): Promise<void> {
     await reconcileQuota().catch((err) => logger.warn({ err: (err as Error).message }, 'quota reconcile failed'));
   }
 
-  await dispatchDueTasks(30);
   logger.debug('scheduler cycle enqueued');
 }
 
 async function main(): Promise<void> {
   ensureSecretsForProduction();
-  registerAllHandlers();
-  await startWorker(1); // scheduler node also processes (safe: task claims are atomic)
-  const queue = getSyncQueue();
-  void queue;
-
   await scheduleCycle();
   const timer = setInterval(() => {
     void scheduleCycle().catch((err) => logger.error({ err: (err as Error).message }, 'scheduler cycle failed'));
@@ -180,7 +172,6 @@ async function main(): Promise<void> {
 
   const shutdown = async () => {
     clearInterval(timer);
-    await stopWorker();
     process.exit(0);
   };
   process.on('SIGINT', () => void shutdown());

@@ -1,3 +1,4 @@
+import { runWithTaskContext } from './task-context.js';
 /**
  * Sync engine executor. Handlers are pure task processors; the engine adds:
  * retries with exponential backoff, retry limits, idempotent re-runs, structured
@@ -13,7 +14,7 @@ function bullConnection() {
   return { url: config.redisUrl, maxRetriesPerRequest: null as null };
 }
 import type { SyncTaskRow } from '../types.js';
-import { claimDueTasks, claimTaskById, deferTaskForQuota, markTaskDone, markTaskFailed, markTaskSkipped, requeueStuckTasks } from './tasks.js';
+import { claimDueTasks, claimTaskById, deferTaskForQuota, markTaskDone, markTaskFailed, markTaskSkipped } from './tasks.js';
 import { isPermanentTaskError, isScopedTaskType, isTaskInScope, SCOPE_SKIP_PREFIX } from './scope-guard.js';
 import { quotaManager } from './quota.js';
 
@@ -34,11 +35,19 @@ export function registeredTaskTypes(): string[] {
 }
 
 export async function processTask(task: SyncTaskRow): Promise<boolean> {
+  return runWithTaskContext(
+    {
+      taskKey: task.task_key,
+      taskType: task.task_type,
+    },
+    () => processTaskWithContext(task),
+  );
+}
+
+async function processTaskWithContext(task: SyncTaskRow): Promise<boolean> {
   const handler = handlers.get(task.task_type);
   const log = logger.child({ task: task.task_key, type: task.task_type, attempt: task.attempts });
   const t0 = Date.now();
-  (globalThis as { __syncTaskKey?: string }).__syncTaskKey = task.task_key;
-  (globalThis as { __syncTaskType?: string }).__syncTaskType = task.task_type;
   const requestedClass = task.params?.quotaClass;
   const taskClass = requestedClass === 'essential' || requestedClass === 'background'
     ? requestedClass
@@ -55,34 +64,34 @@ export async function processTask(task: SyncTaskRow): Promise<boolean> {
     // fixture no longer exists (or left the approved scope) is skipped
     // permanently — it must not be deferred, retried or reach the provider.
     if (isScopedTaskType(task.task_type) && !(await isTaskInScope(task.task_type, task.params ?? {}))) {
-      await markTaskSkipped(task.id, `${SCOPE_SKIP_PREFIX}: ${task.task_key}`, Date.now() - t0);
+      await markTaskSkipped(task.id, task.attempts, `${SCOPE_SKIP_PREFIX}: ${task.task_key}`, Date.now() - t0);
       log.warn('task skipped permanently: target missing or outside approved import scope');
       return true;
     }
     const gate = await quotaManager.allows(taskClass);
     if (!gate.allowed) {
       const delay = quotaManager.deferDelaySeconds(Number(task.quota_defers ?? 0));
-      await deferTaskForQuota(task.id, delay, `deferred: provider quota ${gate.state} (${gate.dailyRemaining} requests remaining)`);
+      await deferTaskForQuota(task.id, task.attempts, delay, `deferred: provider quota ${gate.state} (${gate.dailyRemaining} requests remaining)`);
       log.info({ state: gate.state, class: gate.class, remaining: gate.dailyRemaining, deferredSeconds: delay }, 'task deferred for provider quota (rescheduled with backoff)');
       return true;
     }
     const summary = await handler(task.params ?? {}, task);
-    await markTaskDone(task.id, summary, Date.now() - t0);
+    await markTaskDone(task.id, task.attempts, summary, Date.now() - t0);
     log.info({ summary }, 'task done');
     return true;
   } catch (err) {
     const e = err as Error;
     if (isPermanentTaskError(e)) {
-      await markTaskSkipped(task.id, `skipped (permanent): ${e.message}`, Date.now() - t0);
+      await markTaskSkipped(task.id, task.attempts, `skipped (permanent): ${e.message}`, Date.now() - t0);
       log.warn({ err: e.message }, 'task skipped permanently (not retryable)');
       return true;
     }
-    const failed = await markTaskFailed(task.id, e, Date.now() - t0);
-    log.error({ err: e.message, status: failed.status, attempts: failed.attempts }, 'task failed');
+    const failed = await markTaskFailed(task.id, task.attempts, e, Date.now() - t0);
+    log.error(
+      { err: e.message, status: failed?.status, attempts: failed?.attempts, stale: !failed },
+      'task failed',
+    );
     return false;
-  } finally {
-    delete (globalThis as { __syncTaskKey?: string }).__syncTaskKey;
-    delete (globalThis as { __syncTaskType?: string }).__syncTaskType;
   }
 }
 
@@ -112,15 +121,24 @@ export async function dispatchTask(taskId: number): Promise<void> {
 }
 
 /** Enqueue all due DB tasks that have not been dispatched. */
+const DISPATCH_CONCURRENCY = 2;
+
 export async function dispatchDueTasks(limit = 20): Promise<number> {
-  await requeueStuckTasks(2).catch(() => 0);
-  const tasks = await claimDueTasks(limit);
-  for (const t of tasks) {
-    // reset claim — BullMQ worker will claim via claimTaskById for exactly-once semantics
-    const ok = await processIfClaimable(t);
-    void ok;
+  let processed = 0;
+
+  while (processed < limit) {
+    // Claim only work we can execute immediately. This keeps `running`
+    // semantically accurate and makes stale-task recovery safe.
+    const batch = await claimDueTasks(
+      Math.min(DISPATCH_CONCURRENCY, limit - processed),
+    );
+    if (batch.length === 0) break;
+
+    await Promise.all(batch.map((task) => processIfClaimable(task)));
+    processed += batch.length;
   }
-  return tasks.length;
+
+  return processed;
 }
 
 async function processIfClaimable(task: SyncTaskRow): Promise<void> {
@@ -166,7 +184,6 @@ export async function stopWorker(): Promise<void> {
 export async function drainDueTasks(max = 10_000): Promise<{ processed: number; succeeded: number }> {
   let processed = 0;
   let succeeded = 0;
-  await requeueStuckTasks(2).catch(() => 0);
   while (processed < max) {
     const batch = await claimDueTasks(Math.min(5, max - processed));
     if (batch.length === 0) break;

@@ -25,17 +25,46 @@ export async function syncInjuries(competitionId: number, seasonId: number): Pro
   const provider = await getProvider();
   const ids = await resolveScopedPair(competitionId, seasonId);
   const res = await provider.get<AfInjury>('/injuries', { league: ids.provider_id, season: ids.season_year });
+  const records = res.data.response;
+
+  // Resolve provider IDs in bulk. Injury feeds can contain thousands of rows;
+  // doing player/team lookups per row creates thousands of DB round trips.
+  const playerProviderIds = [...new Set(
+    records.flatMap((rec) => rec.player?.id != null ? [String(rec.player.id)] : []),
+  )];
+  const teamProviderIds = [...new Set(
+    records.flatMap((rec) => rec.team?.id != null ? [String(rec.team.id)] : []),
+  )];
+
+  const players = playerProviderIds.length > 0
+    ? await query<{ id: number; provider_id: string }>(
+        `SELECT id, provider_id FROM players
+          WHERE provider = 'api-football' AND provider_id = ANY($1::text[])`,
+        [playerProviderIds],
+      )
+    : [];
+  const teams = teamProviderIds.length > 0
+    ? await query<{ id: number; provider_id: string }>(
+        `SELECT id, provider_id FROM teams
+          WHERE provider = 'api-football' AND provider_id = ANY($1::text[])`,
+        [teamProviderIds],
+      )
+    : [];
+
+  const playerIds = new Map(players.map((row) => [String(row.provider_id), Number(row.id)]));
+  const teamIds = new Map(teams.map((row) => [String(row.provider_id), Number(row.id)]));
+
   let count = 0;
-  for (const rec of res.data.response) {
+  for (const rec of records) {
     const playerId = rec.player?.id != null
-      ? await queryOne<{ id: number }>(`SELECT id FROM players WHERE provider_id = $1`, [String(rec.player.id)])
+      ? playerIds.get(String(rec.player.id)) ?? null
       : null;
     const teamId = rec.team?.id != null
-      ? await queryOne<{ id: number }>(`SELECT id FROM teams WHERE provider_id = $1`, [String(rec.team.id)])
+      ? teamIds.get(String(rec.team.id)) ?? null
       : null;
     const ok = await upsertSidelined(rec, {
-      playerId: playerId?.id ?? null,
-      teamId: teamId?.id ?? null,
+      playerId,
+      teamId,
       competitionId,
       seasonId,
     });
