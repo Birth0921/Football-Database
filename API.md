@@ -7,6 +7,12 @@ Authentication: `X-API-Key: pf_live_…` (platform-issued — see
 [API_KEYS.md](API_KEYS.md)). Health endpoints and `/admin/login` are public;
 everything else requires a key with the right scope.
 
+Clients: use [@football-data-platform/client](../sdk/typescript) (retries,
+pagination, typed errors) or plain HTTP. Building an external app? Start with
+[PREDICTION_APP.md](PREDICTION_APP.md).
+
+> There are no CORS headers — call the API from a server, not from browser JS.
+
 ## Endpoints
 
 | Method & path | Scope | Description |

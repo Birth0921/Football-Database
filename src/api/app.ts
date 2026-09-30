@@ -88,7 +88,7 @@ export function createApp(): Express {
     const rows = await query(
       `SELECT c.*, co.name AS country_name FROM competitions c
         LEFT JOIN countries co ON co.id = c.country_id ${where}
-        ORDER BY c.name ASC LIMIT $${country ? 2 : 1} OFFSET $${country ? 3 : 2}`,
+        ORDER BY c.name ASC, c.id ASC LIMIT $${country ? 2 : 1} OFFSET $${country ? 3 : 2}`,
       country ? [country, perPage, offset] : [perPage, offset],
     );
     const body = paginated(rows, total, page, perPage);
@@ -169,7 +169,7 @@ export function createApp(): Express {
     const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
     const total = (await queryOne<{ c: number }>(`SELECT count(*)::int AS c FROM teams t ${where}`, params))?.c ?? 0;
     params.push(perPage, offset);
-    const rows = await query(`SELECT t.* FROM teams t ${where} ORDER BY t.name ASC LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
+    const rows = await query(`SELECT t.* FROM teams t ${where} ORDER BY t.name ASC, t.id ASC LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
     res.json(paginated(rows, total, page, perPage));
   }));
   v1.get('/teams/:id', asyncHandler(async (req, res) => {
@@ -227,7 +227,7 @@ export function createApp(): Express {
     const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
     const total = (await queryOne<{ c: number }>(`SELECT count(*)::int AS c FROM players p ${where}`, params))?.c ?? 0;
     params.push(perPage, offset);
-    const rows = await query(`SELECT p.* FROM players p ${where} ORDER BY p.name ASC LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
+    const rows = await query(`SELECT p.* FROM players p ${where} ORDER BY p.name ASC, p.id ASC LIMIT $${params.length - 1} OFFSET $${params.length}`, params);
     res.json(paginated(rows, total, page, perPage));
   }));
   v1.get('/players/:id', asyncHandler(async (req, res) => {
@@ -260,7 +260,7 @@ export function createApp(): Express {
   v1.get('/referees', asyncHandler(async (req, res) => {
     const { page, perPage, offset } = pagination(req);
     const total = (await queryOne<{ c: number }>(`SELECT count(*)::int AS c FROM referees`))?.c ?? 0;
-    const rows = await query(`SELECT * FROM referees ORDER BY name ASC LIMIT $1 OFFSET $2`, [perPage, offset]);
+    const rows = await query(`SELECT * FROM referees ORDER BY name ASC, id ASC LIMIT $1 OFFSET $2`, [perPage, offset]);
     res.json(paginated(rows, total, page, perPage));
   }));
   v1.get('/referees/:id', asyncHandler(async (req, res) => {
@@ -327,7 +327,7 @@ export function createApp(): Express {
     const rows = await query(
       `SELECT
        ${fixtureCols}
-       ${fixtureJoin} ${where} ORDER BY f.kickoff_utc ASC NULLS LAST LIMIT $${params.length - 1} OFFSET $${params.length}`,
+       ${fixtureJoin} ${where} ORDER BY f.kickoff_utc ASC NULLS LAST, f.id ASC LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params,
     );
     res.json(paginated(rows, total, page, perPage));
@@ -339,7 +339,7 @@ export function createApp(): Express {
       `SELECT
        ${fixtureCols}
        ${fixtureJoin} WHERE f.status_short = 'NS' AND f.kickoff_utc > now()
-       ORDER BY f.kickoff_utc ASC LIMIT $1 OFFSET $2`,
+       ORDER BY f.kickoff_utc ASC, f.id ASC LIMIT $1 OFFSET $2`,
       [perPage, offset],
     );
     res.json(paginated(rows, total, page, perPage));
@@ -350,7 +350,7 @@ export function createApp(): Express {
     const rows = await query(
       `SELECT
        ${fixtureCols}
-       ${fixtureJoin} WHERE f.status_short IN ('1H','HT','2H','ET','BT','P','INT') ORDER BY f.kickoff_utc ASC`,
+       ${fixtureJoin} WHERE f.status_short IN ('1H','HT','2H','ET','BT','P','INT') ORDER BY f.kickoff_utc ASC, f.id ASC`,
     );
     await cacheSet(cacheKeys.live(), rows, CACHE_TTL.liveFixtures);
     res.json({ ok: true, data: rows });
@@ -363,7 +363,7 @@ export function createApp(): Express {
     const rows = await query(
       `SELECT
        ${fixtureCols}
-       ${fixtureJoin} ${where} ORDER BY f.kickoff_utc DESC LIMIT $2 OFFSET $3`,
+       ${fixtureJoin} ${where} ORDER BY f.kickoff_utc DESC, f.id DESC LIMIT $2 OFFSET $3`,
       [day, perPage, offset],
     );
     res.json(paginated(rows, total, page, perPage));

@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Prediction App — Football Data Platform</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot"></span>
+        <div>
+          <h1>Prediction App</h1>
+          <p class="sub" id="status-line">connecting…</p>
+        </div>
+      </div>
+      <div class="controls">
+        <select id="competition" aria-label="Competition">
+          <option value="">All competitions</option>
+        </select>
+        <label class="field">
+          Fixtures
+          <select id="limit">
+            <option>12</option>
+            <option selected>24</option>
+            <option>48</option>
+          </select>
+        </label>
+        <button id="refresh" type="button">Refresh</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Upcoming fixtures</h2>
+          <span class="meta" id="meta-line"></span>
+        </div>
+        <div id="fixtures" class="fixtures">
+          <p class="empty">Loading…</p>
+        </div>
+      </section>
+
+      <aside class="panel detail" id="detail">
+        <div class="panel-head"><h2>Fixture detail</h2></div>
+        <p class="empty">Select a fixture to see the model breakdown.</p>
+      </aside>
+    </main>
+
+    <footer>
+      <p>
+        Data: your Football Data Platform REST API (<code>X-API-Key</code>, key stays server-side).
+        Model: Poisson + Dixon–Coles, optionally blended with strengths trained on the read-only database.
+      </p>
+    </footer>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
