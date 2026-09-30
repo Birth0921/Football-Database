@@ -72,6 +72,12 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  // This file seeds rows in PROTECTED tables (a key + a fake managed secret) to
+  // prove the reset leaves them alone. Remove them again: the reset never
+  // touches protected tables, so they would otherwise leak into later suites
+  // (e.g. the exactly-one-managed-secret assertion in website-key.test.ts).
+  if (apiKeyId) await query(`DELETE FROM api_keys WHERE id = $1`, [apiKeyId]); // cascades the secret row
+  await query(`DELETE FROM managed_key_secrets WHERE api_key_id = $1`, [apiKeyId]);
   await closeRedis();
   await closePool();
 });
@@ -306,7 +312,19 @@ describe('clean rebuild after reset', () => {
     const q = await quotaManager.status();
     await quotaManager.observeExternal(0, q.dailyLimit);
     await query(`UPDATE sync_tasks SET scheduled_for = now(), quota_defers = 0 WHERE task_type = 'fixtures:import' AND status = 'pending'`);
-    await drainDueTasks(5000);
+    // Drain the one-time import tasks themselves. A blanket drainDueTasks()
+    // would also run every child task they enqueue (per-fixture details,
+    // statistics, …), which is minutes of work and nothing here depends on it.
+    const importTasks = await query<{ id: number }>(
+      `SELECT id FROM sync_tasks
+        WHERE task_type = 'fixtures:import' AND status IN ('pending', 'failed')
+        ORDER BY priority ASC, id ASC`,
+    );
+    expect(importTasks.length).toBeGreaterThan(0);
+    for (const task of importTasks) {
+      const claimed = await claimTaskById(Number(task.id));
+      if (claimed) await processTask(claimed);
+    }
     const report = await buildImportScopeReport();
     expect(report.competitionSeasons.historicalImported).toBe(12);
     expect(report.competitionSeasons.historicalPending).toBe(0);

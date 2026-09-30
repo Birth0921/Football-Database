@@ -248,7 +248,7 @@ describe('sync engine: retries, resume, failed handling', () => {
     expect(stored!.attempts).toBe(2);
     const summary = await syncSummary();
     expect(summary.failed).toBeGreaterThanOrEqual(1);
-    await markTaskDone(stored!.id, { recovered: true }, 1);
+    await markTaskDone(stored!.id, stored!.attempts, { recovered: true }, 1);
   });
 
   it('task keys are idempotent — re-enqueueing does not duplicate', async () => {

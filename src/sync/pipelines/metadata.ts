@@ -367,7 +367,9 @@ export async function discoverCoverage(competitionId: number, seasonId: number):
     lineups: true,
     fixture_statistics: true,
     player_statistics: players,
-    standings: true,
+    // probed above: cups and leagues without a table report no standings, and
+    // the standings pipeline skips them instead of spending quota on nothing
+    standings,
     players,
     top_scorers: players,
     top_assists: players,
