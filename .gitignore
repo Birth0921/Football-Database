@@ -13,3 +13,8 @@ data/
 
 # runtime-provisioned website API key (secret)
 .website-api-key
+
+# prediction-app example: generated model, exported datasets, its own lockfile
+examples/prediction-app/model/
+examples/prediction-app/*.csv
+examples/prediction-app/package-lock.json

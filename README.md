@@ -66,6 +66,27 @@ curl -H "X-API-Key: $FOOTBALL_API_KEY" \
   "$FOOTBALL_API_BASE_URL/predictions/features/12345"
 ```
 
+### Building an external app (prediction app)
+
+[PREDICTION_APP.md](PREDICTION_APP.md) is the end-to-end guide: expose the API,
+create a scoped `pf_live_…` key, call it from a server, and optionally train on
+the warehouse through the read-only role. Ready-made pieces:
+
+| Piece | Path |
+|-------|------|
+| TypeScript client SDK (auth, retries, pagination, typed errors) | [sdk/typescript](sdk/typescript) |
+| Runnable prediction app (Poisson + Dixon–Coles, UI, trainer) | [examples/prediction-app](examples/prediction-app) |
+| Read-only role + training view | `migrations/0008_prediction_readonly_role.sql` |
+
+```ts
+import { FootballDataClient } from '@football-data-platform/client';
+const api = new FootballDataClient({
+  baseUrl: process.env.FOOTBALL_API_BASE_URL!,
+  apiKey: process.env.FOOTBALL_API_KEY!,
+});
+const { data } = await api.predictionFeatures(12345);
+```
+
 ## Services
 
 | Service        | Command                 | Port | Purpose                                  |
@@ -116,6 +137,7 @@ npx tsx scripts/bulk-finalize.ts  # finalize all completed fixtures
 | [SYNC.md](SYNC.md) | synchronization, quota management, priorities |
 | [API.md](API.md) | REST endpoints |
 | [API_KEYS.md](API_KEYS.md) | our API-key system (create/rotate/revoke/scopes) |
+| [PREDICTION_APP.md](PREDICTION_APP.md) | how external apps consume the platform (keys, SDK, training) |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | production deployment |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | common failures & fixes |
 | [Soccer.md](Soccer.md) | original build specification |
@@ -123,13 +145,18 @@ npx tsx scripts/bulk-finalize.ts  # finalize all completed fixtures
 ## Testing
 
 ```bash
-npm test          # 48 unit/integration/API/sync/quota/security tests
+npm test          # unit/integration/API/sync/quota/security + client-SDK + training tests
 ```
 
 Coverage includes: API-key generation/rotation/revocation/expiry/scopes, rate
 limiting, provider mapping, duplicate-import idempotency, sync resume after
 failure, quota thresholds, Redis cache, referee/league derived statistics,
 data-quality checks, and proof the provider key never appears in responses.
+
+The client SDK (`tests/prediction-client.test.ts`) and the training pipeline
+(`tests/prediction-training.test.ts`) are covered too: key handling, retry/429
+behaviour, pagination stability, point-in-time leakage safety, and recovery of
+known team strengths from simulated data.
 
 ## Environment variables
 

@@ -85,3 +85,26 @@ countries ─┬─< competitions ──< competition_seasons >── seasons
 5. **Historical completed fixtures are immutable** once `finalized = TRUE`:
   details are not re-fetched unless data is missing (post-match pipeline
    reuses stored rows).
+
+## External read access (consumers)
+
+Consumers such as a prediction app normally go through the REST API. For bulk
+model training, migration `0008_prediction_readonly_role.sql` provides:
+
+- role **`football_readonly`** (`LOGIN`, `SELECT` on every table and on tables
+  created by later migrations; no `INSERT`/`UPDATE`/`DELETE`). Set its password
+  out of band — it is never stored in git:
+  `ALTER ROLE football_readonly PASSWORD '<secret>';`
+- view **`prediction_training_matches`** — completed matches with team,
+  competition and season names: a stable contract for consumers.
+
+```bash
+psql "postgres://football_readonly:<secret>@host:5432/football" \
+  -c "SELECT * FROM prediction_training_matches LIMIT 5"
+```
+
+Pre-match features are deliberately **not** in that view: they must be computed
+point-in-time (strictly before kickoff) or models learn from the future. See
+[examples/prediction-app/src/training/dataset.ts](examples/prediction-app/src/training/dataset.ts)
+for a leakage-free query and [PREDICTION_APP.md](PREDICTION_APP.md) for the
+whole workflow.

@@ -44,7 +44,13 @@
     "api-key:list": "tsx src/cli/api-key-list.ts",
     "devdb:start": "tsx scripts/dev-db.ts",
     "doctor": "tsx src/cli/doctor.ts",
-    "bulk-finalize": "tsx scripts/bulk-finalize.ts"
+    "bulk-finalize": "tsx scripts/bulk-finalize.ts",
+    "sdk:build": "npm --prefix sdk/typescript run build",
+    "sdk:typecheck": "npm --prefix sdk/typescript run typecheck",
+    "example:install": "npm --prefix examples/prediction-app install",
+    "example:dev": "npm --prefix examples/prediction-app run dev",
+    "example:train": "npm --prefix examples/prediction-app run train",
+    "typecheck:all": "npm run typecheck && npm run sdk:typecheck && npm --prefix examples/prediction-app run typecheck"
   },
   "dependencies": {
     "argparse": "^3.0.2",

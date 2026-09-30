@@ -125,3 +125,13 @@ FOOTBALL_API_KEY=pf_live_xxxxxxxxxxxxxxxx
 
 The prediction app must contain **only** `FOOTBALL_API_KEY` (ours). If it ever
 contains `API_FOOTBALL_KEY`, something is wrong.
+
+## Next steps for app developers
+
+- [PREDICTION_APP.md](PREDICTION_APP.md) — full integration guide (deploy, key
+  scopes, rate limits, caching, training, go-live checklist)
+- [sdk/typescript](sdk/typescript) — official client (SDK-level retries,
+  `Retry-After`, pagination helpers, typed errors)
+- [examples/prediction-app](examples/prediction-app) — reference app: API for
+  live scoring, read-only database (`football_readonly`, migration 0008) for
+  training
